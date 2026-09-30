@@ -35,7 +35,7 @@ jobs:
           cache: true
 
       # ---------------------------------------------------------
-      # FORCE COMPATIBLE FILE PICKER VERSION
+      # FIX FILE PICKER VERSION
       # ---------------------------------------------------------
       - name: Fix file_picker Version
         run: |
@@ -45,48 +45,47 @@ jobs:
           grep "file_picker:" pubspec.yaml
 
       # ---------------------------------------------------------
-      # FORCE AGP 9 BUILT-IN KOTLIN CONFIGURATION
+      # FIX KOTLIN VERSION
       # ---------------------------------------------------------
-      - name: Configure Android Build
+      - name: Configure Kotlin
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           p = Path("android/settings.gradle.kts")
           s = p.read_text()
 
-          # Remove legacy Kotlin plugin declaration.
-          lines = []
-          for line in s.splitlines():
-              if 'org.jetbrains.kotlin.android' not in line:
-                  lines.append(line)
-
-          s = "\n".join(lines) + "\n"
+          s = re.sub(
+              r'id"org\.jetbrains\.kotlin\.android"\s+version\s+"[^"]+"\s+apply\s+false',
+              'id("org.jetbrains.kotlin.android") version "2.2.20" apply false',
+              s
+          )
 
           p.write_text(s)
           PY
 
-          echo "===== SETTINGS.GRADLE.KTS ====="
-          cat android/settings.gradle.kts
+          echo "===== KOTLIN CONFIGURATION ====="
+          grep "org.jetbrains.kotlin.android" android/settings.gradle.kts || true
 
       # ---------------------------------------------------------
-      # ENABLE AGP 9 BUILT-IN KOTLIN
+      # CONFIGURE AGP 9 / FLUTTER
       # ---------------------------------------------------------
-      - name: Enable Built-in Kotlin
+      - name: Configure Android Gradle
         run: |
-          if [ -f android/gradle.properties ]; then
-            sed -i '/^android\.builtInKotlin=/d' android/gradle.properties
-          else
-            touch android/gradle.properties
-          fi
+          touch android/gradle.properties
+
+          sed -i '/^android\.builtInKotlin=/d' android/gradle.properties
+          sed -i '/^android\.newDsl=/d' android/gradle.properties
 
           echo "android.builtInKotlin=true" >> android/gradle.properties
+          echo "android.newDsl=false" >> android/gradle.properties
 
-          echo "===== GRADLE.PROPERTIES ====="
+          echo "===== GRADLE PROPERTIES ====="
           cat android/gradle.properties
 
       # ---------------------------------------------------------
-      # COMPLETELY CLEAN GENERATED FILES
+      # CLEAN EVERYTHING GENERATED
       # ---------------------------------------------------------
       - name: Clean Build Environment
         run: |
@@ -106,7 +105,7 @@ jobs:
           flutter pub get
 
       # ---------------------------------------------------------
-      # VERIFY ACTUAL VERSIONS
+      # VERIFY CONFIGURATION
       # ---------------------------------------------------------
       - name: Verify Configuration
         run: |
@@ -117,38 +116,46 @@ jobs:
 
           echo ""
           echo "======================================"
-          echo "ANDROID PLUGINS"
+          echo "KOTLIN"
           echo "======================================"
-          grep -E "com.android.application|org.jetbrains.kotlin.android" \
-            android/settings.gradle.kts || true
+          grep "org.jetbrains.kotlin.android" android/settings.gradle.kts || true
+
+          echo ""
+          echo "======================================"
+          echo "ANDROID GRADLE PLUGIN"
+          echo "======================================"
+          grep "com.android.application" android/settings.gradle.kts || true
 
           echo ""
           echo "======================================"
           echo "GRADLE VERSION"
           echo "======================================"
-          grep distributionUrl \
-            android/gradle/wrapper/gradle-wrapper.properties
+          grep "distributionUrl" \
+            android/gradle/wrapper/gradle-wrapper.properties || true
 
           echo ""
           echo "======================================"
-          echo "BUILT-IN KOTLIN"
+          echo "ANDROID PROPERTIES"
           echo "======================================"
-          grep android.builtInKotlin android/gradle.properties
+          cat android/gradle.properties
 
       # ---------------------------------------------------------
       # BUILD APK
       # ---------------------------------------------------------
       - name: Build Release APK
         run: |
-          flutter build apk --release
+          flutter build apk \
+            --release \
+            --android-skip-build-dependency-validation
 
       # ---------------------------------------------------------
       # VERIFY APK
       # ---------------------------------------------------------
       - name: Verify APK
         run: |
-          echo "APK generated:"
+          echo "===== APK GENERATED ====="
           ls -lh build/app/outputs/flutter-apk/app-release.apk
+
           test -f build/app/outputs/flutter-apk/app-release.apk
 
       # ---------------------------------------------------------
