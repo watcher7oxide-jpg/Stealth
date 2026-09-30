@@ -34,8 +34,61 @@ jobs:
           channel: stable
           cache: true
 
-      # Completely remove previous generated Flutter/Gradle files
-      - name: Clean Flutter and Gradle
+      # ---------------------------------------------------------
+      # FORCE COMPATIBLE FILE PICKER VERSION
+      # ---------------------------------------------------------
+      - name: Fix file_picker Version
+        run: |
+          sed -i 's/file_picker: .*/file_picker: ^11.0.3/' pubspec.yaml
+
+          echo "===== FILE PICKER ====="
+          grep "file_picker:" pubspec.yaml
+
+      # ---------------------------------------------------------
+      # FORCE AGP 9 BUILT-IN KOTLIN CONFIGURATION
+      # ---------------------------------------------------------
+      - name: Configure Android Build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("android/settings.gradle.kts")
+          s = p.read_text()
+
+          # Remove legacy Kotlin plugin declaration.
+          lines = []
+          for line in s.splitlines():
+              if 'org.jetbrains.kotlin.android' not in line:
+                  lines.append(line)
+
+          s = "\n".join(lines) + "\n"
+
+          p.write_text(s)
+          PY
+
+          echo "===== SETTINGS.GRADLE.KTS ====="
+          cat android/settings.gradle.kts
+
+      # ---------------------------------------------------------
+      # ENABLE AGP 9 BUILT-IN KOTLIN
+      # ---------------------------------------------------------
+      - name: Enable Built-in Kotlin
+        run: |
+          if [ -f android/gradle.properties ]; then
+            sed -i '/^android\.builtInKotlin=/d' android/gradle.properties
+          else
+            touch android/gradle.properties
+          fi
+
+          echo "android.builtInKotlin=true" >> android/gradle.properties
+
+          echo "===== GRADLE.PROPERTIES ====="
+          cat android/gradle.properties
+
+      # ---------------------------------------------------------
+      # COMPLETELY CLEAN GENERATED FILES
+      # ---------------------------------------------------------
+      - name: Clean Build Environment
         run: |
           flutter clean
           rm -rf build
@@ -44,48 +97,71 @@ jobs:
           rm -rf ~/.gradle/caches
           rm -rf ~/.gradle/wrapper/dists
 
-      # Regenerate dependency resolution from pubspec.yaml
+      # ---------------------------------------------------------
+      # REGENERATE DEPENDENCIES
+      # ---------------------------------------------------------
       - name: Regenerate Dependencies
         run: |
           rm -f pubspec.lock
           flutter pub get
 
-      # Show the actual versions being used
-      - name: Verify Dependency Versions
+      # ---------------------------------------------------------
+      # VERIFY ACTUAL VERSIONS
+      # ---------------------------------------------------------
+      - name: Verify Configuration
         run: |
-          echo "===== FILE PICKER ====="
+          echo "======================================"
+          echo "FILE PICKER"
+          echo "======================================"
           flutter pub deps | grep -E "file_picker|file_picker_android" || true
 
           echo ""
-          echo "===== ANDROID GRADLE ====="
-          grep -R "com.android.application" android/settings.gradle.kts || true
+          echo "======================================"
+          echo "ANDROID PLUGINS"
+          echo "======================================"
+          grep -E "com.android.application|org.jetbrains.kotlin.android" \
+            android/settings.gradle.kts || true
 
           echo ""
-          echo "===== KOTLIN ====="
-          grep -R "org.jetbrains.kotlin.android" android/settings.gradle.kts || true
+          echo "======================================"
+          echo "GRADLE VERSION"
+          echo "======================================"
+          grep distributionUrl \
+            android/gradle/wrapper/gradle-wrapper.properties
 
           echo ""
-          echo "===== GRADLE WRAPPER ====="
-          grep "distributionUrl" android/gradle/wrapper/gradle-wrapper.properties || true
+          echo "======================================"
+          echo "BUILT-IN KOTLIN"
+          echo "======================================"
+          grep android.builtInKotlin android/gradle.properties
 
-      # Build completely fresh
+      # ---------------------------------------------------------
+      # BUILD APK
+      # ---------------------------------------------------------
       - name: Build Release APK
-        run: flutter build apk --release
+        run: |
+          flutter build apk --release
 
-      # Make absolutely sure the APK exists
+      # ---------------------------------------------------------
+      # VERIFY APK
+      # ---------------------------------------------------------
       - name: Verify APK
         run: |
-          echo "===== APK ====="
+          echo "APK generated:"
           ls -lh build/app/outputs/flutter-apk/app-release.apk
           test -f build/app/outputs/flutter-apk/app-release.apk
 
-      # Copy APK outside the working directory
+      # ---------------------------------------------------------
+      # COPY APK
+      # ---------------------------------------------------------
       - name: Copy APK
         run: |
           cp build/app/outputs/flutter-apk/app-release.apk \
-          ../app-release-${GITHUB_REF_NAME}.apk
+            ../app-release-${GITHUB_REF_NAME}.apk
 
-      # Publish APK directly to GitHub Release
+      # ---------------------------------------------------------
+      # CREATE GITHUB RELEASE
+      # ---------------------------------------------------------
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
