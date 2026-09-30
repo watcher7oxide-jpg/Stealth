@@ -21,13 +21,23 @@ final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Catch unhandled Flutter framework errors
   FlutterError.onError = (FlutterErrorDetails details) {
     FlutterError.presentError(details);
-    _showGlobalErrorDialog("Flutter Error", details.exception.toString(), details.stack.toString());
+    _showGlobalErrorDialog(
+      "Flutter Runtime Error",
+      details.exception.toString(),
+      details.stack.toString(),
+    );
   };
 
+  // Catch unhandled asynchronous / platform errors
   PlatformDispatcher.instance.onError = (error, stack) {
-    _showGlobalErrorDialog("Async/Platform Error", error.toString(), stack.toString());
+    _showGlobalErrorDialog(
+      "Async Platform Error",
+      error.toString(),
+      stack.toString(),
+    );
     return true;
   };
 
@@ -253,14 +263,17 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final CognitiveMemoryBank _memoryBank = CognitiveMemoryBank();
 
+  // Native GGUF Inference Controller
   final LlamaController _llama = LlamaController();
 
+  // Audio / STT / TTS
   final stt.SpeechToText _speech = stt.SpeechToText();
   final FlutterTts _tts = FlutterTts();
   bool _speechEnabled = false;
   bool _isListening = false;
   bool _voiceResponseEnabled = true;
 
+  // Runtime State
   String? _loadedGgufPath;
   String _modelStatus = "No .gguf loaded";
   bool _isProcessing = false;
@@ -284,18 +297,21 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
-  /// Checks if the previous execution crashed natively
+  /// Intercepts native crash file if the previous run terminated abruptly
   Future<void> _checkPreviousNativeCrash() async {
     try {
       final appDir = await getApplicationDocumentsDirectory();
-      final parentDir = appDir.parent;
-      final crashFile = File('${parentDir.path}/files/last_native_crash.txt');
+      final crashFile = File('${appDir.parent.path}/files/last_native_crash.txt');
 
       if (await crashFile.exists()) {
         final content = await crashFile.readAsString();
-        await crashFile.delete(); // Delete after reading
+        await crashFile.delete();
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          _showGlobalErrorDialog("Crash Detected on Previous Run", content, "Captured by Native Exception Handler");
+          _showGlobalErrorDialog(
+            "Crash Detected on Previous Run",
+            content,
+            "Captured by Native Exception Handler (MainActivity)",
+          );
         });
       }
     } catch (_) {}
@@ -335,6 +351,15 @@ class _ChatScreenState extends State<ChatScreen> {
   /* ------------------- ZERO-RAM CRASH-PROOF MODEL LOADER ------------------- */
 
   Future<void> _selectGgufModel() async {
+    if (kIsWeb) {
+      _showGlobalErrorDialog(
+        "Platform Not Supported",
+        "GGUF native execution requires ARM64 Android hardware and cannot execute in Web browsers.",
+        "Compile and run the APK on a physical Android device.",
+      );
+      return;
+    }
+
     try {
       const typeGroup = XTypeGroup(
         label: 'GGUF Models',
@@ -360,7 +385,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
       setState(() => _modelStatus = "File size: ${fileSizeMB.toStringAsFixed(0)} MB");
 
-      // Memory limit check for 4GB RAM phones:
+      // Guard against kernel OOM kill on 4GB RAM devices:
       if (fileSizeMB > 2300) {
         if (mounted) {
           showDialog(
@@ -370,8 +395,8 @@ class _ChatScreenState extends State<ChatScreen> {
               title: const Text("Model Exceeds Safe RAM Limit", style: TextStyle(color: Colors.redAccent)),
               content: Text(
                 "The selected model is ${fileSizeMB.toStringAsFixed(1)} MB.\n\n"
-                "4GB RAM phones have ~1.6GB free RAM. Loading a file larger than 2.2GB causes Android's kernel to kill the process (OOM Killer).\n\n"
-                "Recommended: Use a 1B, 1.5B, or 3B Q4_K_M model.",
+                "4GB RAM phones have ~1.6GB free RAM. Loading files larger than 2.2GB causes Android's Linux kernel to kill the process (OOM Killer).\n\n"
+                "Recommended: Use a 1B, 1.5B, or 3B Q4_K_M model (e.g. Llama-3.2-1B, Qwen2.5-1.5B, SmolLM2-1.7B).",
                 style: const TextStyle(color: Colors.white70, fontSize: 13),
               ),
               actions: [
@@ -383,7 +408,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   child: const Text("Attempt Load"),
                   onPressed: () {
                     Navigator.pop(ctx);
-                    _bindModelDirect(file.path);
+                    _bindModel(file.path);
                   },
                 ),
               ],
@@ -393,53 +418,50 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      await _bindModelDirect(file.path);
+      await _bindModel(file.path);
     } catch (e, stack) {
       _showGlobalErrorDialog("File Selection Failed", e.toString(), stack.toString());
     }
   }
 
-  /// Passes the filesystem path directly to llama.cpp with ZERO memory allocation
-  Future<void> _bindModelDirect(String rawPath) async {
+  /// Passes the filesystem path directly to llama.cpp with ZERO heap memory allocation
+  Future<void> _bindModel(String rawPath) async {
     try {
       setState(() => _modelStatus = "Verifying direct path...");
 
-      String targetPath = rawPath;
-      final file = File(targetPath);
-
-      // Check if file is readable directly by native C++
+      final file = File(rawPath);
       if (!await file.exists()) {
-        setState(() => _modelStatus = "Path unreadable: $targetPath");
+        setState(() => _modelStatus = "Path unreadable: $rawPath");
         _showGlobalErrorDialog(
           "Storage Access Error",
-          "File does not exist at path: $targetPath",
+          "File does not exist at path: $rawPath",
           "Android Scoped Storage may be blocking direct access to this directory.",
         );
         return;
       }
 
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('saved_gguf_path', targetPath);
+      await prefs.setString('saved_gguf_path', rawPath);
 
       setState(() => _modelStatus = "Initializing llama.cpp engine...");
 
-      // 4GB RAM Phone Tuned Parameters:
+      // 4GB RAM Tuned Settings:
       // contextSize: 512 keeps the KV-cache under 120MB
-      // threads: 2 prevents CPU thermal throttling
+      // threads: 2 prevents thermal throttling and CPU spike
       await _llama.loadModel(
-        modelPath: targetPath,
+        modelPath: rawPath,
         threads: 2,
         contextSize: 512,
       );
 
       setState(() {
-        _loadedGgufPath = targetPath;
-        _modelStatus = "Ready: ${targetPath.split('/').last}";
+        _loadedGgufPath = rawPath;
+        _modelStatus = "Ready: ${rawPath.split('/').last}";
       });
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Model loaded: ${targetPath.split('/').last}")),
+          SnackBar(content: Text("Model loaded: ${rawPath.split('/').last}")),
         );
       }
     } catch (e, stack) {
