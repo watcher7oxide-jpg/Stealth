@@ -1,39 +1,38 @@
-allprojects {
-    repositories {
-        google()
-        mavenCentral()
+plugins {
+    id("com.android.application")
+    id("kotlin-android")
+    id("dev.flutter.flutter-gradle-plugin")
+}
+
+android {
+    namespace = "com.example.neural_companion" // Match your package name
+    compileSdk = flutter.compileSdkVersion
+    ndkVersion = flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    defaultConfig {
+        applicationId = "com.example.neural_companion" // Match your package name
+        minSdk = flutter.minSdkVersion
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+    }
+
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.getByName("debug")
+        }
     }
 }
 
-subprojects {
-    configurations.all {
-        resolutionStrategy {
-            force("androidx.core:core:1.13.1")
-        }
-    }
-
-    afterEvaluate {
-        if (extensions.findByName("android") != null) {
-            extensions.configure<com.android.build.gradle.BaseExtension> {
-                if (namespace == null) {
-                    namespace = project.group.toString()
-                }
-
-                lintOptions {
-                    isAbortOnError = false
-                    isCheckReleaseBuilds = false
-                }
-            }
-        }
-
-        // Disable problematic lint / AAR metadata tasks
-        tasks.configureEach {
-            if (
-                name.contains("Lint", ignoreCase = true) ||
-                name.contains("AarMetadata", ignoreCase = true)
-            ) {
-                enabled = false
-            }
-        }
-    }
+flutter {
+    source = "../.."
 }
