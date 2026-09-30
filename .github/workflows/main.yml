@@ -17,13 +17,14 @@ jobs:
   build:
     name: Build Flutter APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
+
+    env:
+      TERM: dumb
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -45,29 +46,14 @@ jobs:
           elif [ -f "neural_companion/pubspec.yaml" ]; then
             echo "TARGET_DIR=neural_companion" >> $GITHUB_ENV
           else
-            echo "::error::pubspec.yaml was not found in root or neural_companion/!"
+            echo "::error::pubspec.yaml was not found!"
             exit 1
           fi
 
-      - name: Verify Environment
+      - name: Fetch Dependencies
         working-directory: ${{ env.TARGET_DIR }}
         run: |
-          echo "Current working directory: $PWD"
-          flutter --version
-          dart --version
-
-      - name: Fetch Dependencies (Verbose)
-        working-directory: ${{ env.TARGET_DIR }}
-        timeout-minutes: 10
-        env:
-          GIT_TERMINAL_PROMPT: 0
-        run: |
-          echo "Clearing stale locks and caches..."
-          rm -f pubspec.lock
-          rm -rf .dart_tool
-
-          echo "Running flutter pub get with real-time logs..."
-          flutter pub get --verbose
+          flutter pub get
 
       - name: Analyze Dart Code
         working-directory: ${{ env.TARGET_DIR }}
@@ -76,9 +62,8 @@ jobs:
 
       - name: Build Release APK
         working-directory: ${{ env.TARGET_DIR }}
-        timeout-minutes: 15
         run: |
-          flutter build apk --release --verbose
+          flutter build apk --release
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
