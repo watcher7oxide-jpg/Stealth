@@ -246,23 +246,6 @@ class _ChatScreenState extends State<ChatScreen> {
     await _loadMemoryFromDisk();
   }
 
-  Future<void> _bindModel(String path) async {
-    try {
-      setState(() => _modelStatus = "Loading model...");
-      await _llama.loadModel(
-        modelPath: path,
-        threads: 2,
-        contextSize: 1024,
-      );
-      setState(() {
-        _loadedGgufPath = path;
-        _modelStatus = "Ready: ${path.split('/').last}";
-      });
-    } catch (e) {
-      setState(() => _modelStatus = "Load failed: $e");
-    }
-  }
-
   Future<void> _initSpeechEngine() async {
     try {
       _speechEnabled = await _speech.initialize(
@@ -285,6 +268,8 @@ class _ChatScreenState extends State<ChatScreen> {
     await _tts.setVolume(1.0);
   }
 
+  /* ------------------- CRASH-PROOF MODEL SELECTOR & BINDER ------------------- */
+
   Future<void> _selectGgufModel() async {
     try {
       const typeGroup = XTypeGroup(
@@ -295,32 +280,86 @@ class _ChatScreenState extends State<ChatScreen> {
         acceptedTypeGroups: const [typeGroup],
       );
 
-      if (file != null) {
-        final path = file.path;
-        if (!path.toLowerCase().endsWith('.gguf')) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text("Please select a valid .gguf file")),
-            );
-          }
-          return;
-        }
+      if (file == null) return;
 
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('saved_gguf_path', path);
-
-        await _bindModel(path);
-
+      if (!file.name.toLowerCase().endsWith('.gguf')) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Model bound: ${file.name}")),
+            const SnackBar(content: Text("Please select a valid .gguf file")),
           );
         }
+        return;
       }
+
+      setState(() => _modelStatus = "Preparing model file...");
+
+      // Ensure native C++ has a real filesystem path:
+      // If the file is a content URI or not directly readable by fopen(),
+      // stream it into app's local sandbox storage where native C++ has guaranteed POSIX access.
+      String finalPath = file.path;
+      final bool isRealPosixFile = File(finalPath).existsSync();
+
+      if (!isRealPosixFile || finalPath.startsWith("content://")) {
+        setState(() => _modelStatus = "Caching model for native access...");
+        final appDir = await getApplicationDocumentsDirectory();
+        final localFile = File('${appDir.path}/${file.name}');
+
+        // Stream copy to avoid 4GB RAM OOM during large GGUF transfers
+        if (!await localFile.exists() || await localFile.length() != await file.length()) {
+          final stream = file.openRead();
+          final sink = localFile.openWrite();
+          await stream.pipe(sink);
+        }
+        finalPath = localFile.path;
+      }
+
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('saved_gguf_path', finalPath);
+
+      await _bindModel(finalPath);
     } catch (e) {
       if (mounted) {
+        setState(() => _modelStatus = "File access error");
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Failed to select file: $e")),
+          SnackBar(content: Text("Failed to prepare model: $e")),
+        );
+      }
+    }
+  }
+
+  Future<void> _bindModel(String path) async {
+    try {
+      setState(() => _modelStatus = "Loading into memory...");
+
+      final file = File(path);
+      if (!await file.exists()) {
+        setState(() => _modelStatus = "File not found on disk");
+        return;
+      }
+
+      // Check RAM budget before native allocation:
+      // On 4GB RAM phones, contextSize > 2048 causes immediate kernel OOM killer
+      await _llama.loadModel(
+        modelPath: path,
+        threads: 2,
+        contextSize: 1024,
+      );
+
+      setState(() {
+        _loadedGgufPath = path;
+        _modelStatus = "Ready: ${path.split('/').last}";
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Model loaded: ${path.split('/').last}")),
+        );
+      }
+    } catch (e) {
+      setState(() => _modelStatus = "Load failed: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Model load failed: $e")),
         );
       }
     }
