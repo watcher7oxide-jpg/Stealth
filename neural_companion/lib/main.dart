@@ -338,32 +338,71 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      setState(() => _modelStatus = "Preparing model file...");
+      final int fileSizeBytes = await file.length();
+      final double fileSizeMB = fileSizeBytes / (1024 * 1024);
 
-      String finalPath = file.path;
-      final bool isRealPosixFile = File(finalPath).existsSync();
-
-      if (!isRealPosixFile || finalPath.startsWith("content://")) {
-        setState(() => _modelStatus = "Caching model for native access...");
-        final appDir = await getApplicationDocumentsDirectory();
-        final localFile = File('${appDir.path}/${file.name}');
-
-        if (!await localFile.exists() || await localFile.length() != await file.length()) {
-          await file.saveTo(localFile.path);
+      // 4GB RAM Phone Safety Guard:
+      // If a model is > 2200 MB (2.2 GB), Android kernel OOM killer will kill the process.
+      if (fileSizeMB > 2300) {
+        if (mounted) {
+          showDialog(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              backgroundColor: const Color(0xFF1E2230),
+              title: const Text("Model Too Large for 4GB RAM", style: TextStyle(color: Colors.redAccent)),
+              content: Text(
+                "The selected model is ${fileSizeMB.toStringAsFixed(1)} MB.\n\n"
+                "A 4GB RAM phone only has ~1.6GB of available free RAM. Loading models larger than 2.2GB triggers Android's Out-Of-Memory Killer.\n\n"
+                "Recommended: Use a 1B, 1.5B, or 3B Q4_K_M model (e.g., Llama-3.2-1B, Qwen2.5-1.5B, or SmolLM2-1.7B).",
+                style: const TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+              actions: [
+                TextButton(
+                  child: const Text("Cancel"),
+                  onPressed: () => Navigator.pop(ctx),
+                ),
+                ElevatedButton(
+                  child: const Text("Load Anyway"),
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    _proceedWithModel(file);
+                  },
+                ),
+              ],
+            ),
+          );
         }
-        finalPath = localFile.path;
+        return;
       }
 
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('saved_gguf_path', finalPath);
-
-      await _bindModel(finalPath);
+      await _proceedWithModel(file);
     } catch (e, stack) {
       _showGlobalErrorDialog("File Selection Failed", e.toString(), stack.toString());
-      if (mounted) {
-        setState(() => _modelStatus = "File Error: $e");
-      }
     }
+  }
+
+  Future<void> _proceedWithModel(XFile file) async {
+    setState(() => _modelStatus = "Preparing model...");
+
+    String finalPath = file.path;
+    final bool isRealPosixFile = File(finalPath).existsSync();
+
+    // If it's a Content URI, stream it to local sandbox storage for direct POSIX access
+    if (!isRealPosixFile || finalPath.startsWith("content://")) {
+      setState(() => _modelStatus = "Caching model for native access...");
+      final appDir = await getApplicationDocumentsDirectory();
+      final localFile = File('${appDir.path}/${file.name}');
+
+      if (!await localFile.exists() || await localFile.length() != await file.length()) {
+        await file.saveTo(localFile.path);
+      }
+      finalPath = localFile.path;
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('saved_gguf_path', finalPath);
+
+    await _bindModel(finalPath);
   }
 
   Future<void> _bindModel(String path) async {
@@ -376,15 +415,13 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      final int sizeBytes = await file.length();
-      final double sizeMB = sizeBytes / (1024 * 1024);
+      debugPrint("Calling native llama.cpp loadModel: $path");
 
-      debugPrint("Starting llama.cpp native load: $path ($sizeMB MB)");
-
+      // 4GB RAM Phone Tuned Settings
       await _llama.loadModel(
         modelPath: path,
-        threads: 2,
-        contextSize: 1024,
+        threads: 2,        // 2 threads prevents thermal throttling and CPU spike
+        contextSize: 1024, // 1024 keeps the KV-cache under 300MB
       );
 
       setState(() {
@@ -398,7 +435,7 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
     } catch (e, stack) {
-      _showGlobalErrorDialog("Model Binding Native Error", e.toString(), stack.toString());
+      _showGlobalErrorDialog("Native Model Load Error", e.toString(), stack.toString());
       if (mounted) {
         setState(() => _modelStatus = "Load error: $e");
       }
