@@ -34,6 +34,11 @@ jobs:
           flutter-version: "3.27.4"
           cache: true
 
+      # Forces Gradle wrapper to 8.10.2 so Gradle 9's groovy.xml.QName crash cannot happen
+      - name: Enforce Gradle 8.10.2
+        run: |
+          sed -i 's|gradle-9\.[0-9.]*|gradle-8.10.2|g' android/gradle/wrapper/gradle-wrapper.properties
+
       - name: Get Dependencies
         run: flutter pub get
 
