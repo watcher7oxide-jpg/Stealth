@@ -233,7 +233,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // ---------------------------------------------------------
-  // LOCAL MODEL LOADER (Tuned for 4 GB RAM)
+  // LOCAL MODEL LOADER
   // ---------------------------------------------------------
   Future<void> _selectAndLoadModelFile() async {
     FilePickerResult? result = await FilePicker.platform.pickFiles(
@@ -257,29 +257,14 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     try {
-      // Free old engine if already loaded
       _engine?.dispose();
 
-      // Ensure dynamic library is bound on Android
       if (Platform.isAndroid && Llama.libraryPath == null) {
         Llama.libraryPath = 'libllama.so';
       }
 
-      // Configure strictly for 4 GB RAM:
-      // - nCtx: 1024 tokens (prevents KV cache memory spikes)
-      // - nThreads: 4 (balances performance cores without thermal throttling)
-      final modelParams = ModelParams()..nGpuLayers = 0;
-      final contextParams = ContextParams()
-        ..nCtx = 1024
-        ..nThreads = 4;
-      final samplerParams = SamplerParams()..temp = 0.7;
-
-      final llama = Llama(
-        path,
-        modelParams,
-        contextParams,
-        samplerParams,
-      );
+      // Takes only the path argument in llama_cpp_dart
+      final llama = Llama(path);
 
       setState(() {
         _engine = llama;
@@ -399,7 +384,7 @@ class _ChatScreenState extends State<ChatScreen> {
           responseBuffer.write(token);
         }
         if (done) break;
-        // Yield to Flutter event loop so UI stays smooth
+        // Yield to Flutter event loop so UI does not freeze
         await Future.delayed(const Duration(milliseconds: 1));
       }
 
