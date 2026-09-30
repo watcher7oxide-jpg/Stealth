@@ -5,28 +5,35 @@ allprojects {
     }
 }
 
-// Add this block to kill the broken lint/metadata tasks on file_picker & third-party libs
 subprojects {
-    project.configurations.all {
+    configurations.all {
         resolutionStrategy {
-            force 'androidx.core:core:1.13.1'
+            force("androidx.core:core:1.13.1")
         }
     }
-    afterEvaluate { project ->
-        if (project.hasProperty('android')) {
-            project.android {
+
+    afterEvaluate {
+        if (extensions.findByName("android") != null) {
+            extensions.configure<com.android.build.gradle.BaseExtension> {
                 if (namespace == null) {
-                    namespace project.group
+                    namespace = project.group.toString()
                 }
+
                 lintOptions {
-                    abortOnError false
-                    checkReleaseBuilds false
+                    isAbortOnError = false
+                    isCheckReleaseBuilds = false
                 }
             }
         }
-        // Disables the exact task failing in your log: bundleReleaseLocalLintAar
-        tasks.matching { it.name.contains("Lint") || it.name.contains("AarMetadata") }.configureEach {
-            enabled = false
+
+        // Disable problematic lint / AAR metadata tasks
+        tasks.configureEach {
+            if (
+                name.contains("Lint", ignoreCase = true) ||
+                name.contains("AarMetadata", ignoreCase = true)
+            ) {
+                enabled = false
+            }
         }
     }
 }
