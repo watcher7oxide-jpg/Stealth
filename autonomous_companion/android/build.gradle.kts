@@ -30,13 +30,11 @@ tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
 
-// Add this at the bottom of android/build.gradle:
 subprojects {
-    afterEvaluate { project ->
-        if (project.hasProperty('android')) {
-            project.android {
-                compileSdk = 36
-            }
+    plugins.withId("com.android.library") {
+        extensions.findByName("android")?.let { androidExt ->
+            val setCompileSdk = androidExt.javaClass.getMethod("setCompileSdk", Int::class.javaPrimitiveType)
+            setCompileSdk.invoke(androidExt, 36)
         }
     }
 }
