@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:llama_flutter_android/llama_flutter_android.dart' hide ChatMessage;
 import 'package:path_provider/path_provider.dart';
@@ -13,9 +15,60 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Global uncaught Flutter error handler
+  FlutterError.onError = (FlutterErrorDetails details) {
+    FlutterError.presentError(details);
+    _showGlobalErrorDialog("Flutter Error", details.exception.toString(), details.stack.toString());
+  };
+
+  // Global platform/asynchronous error handler
+  PlatformDispatcher.instance.onError = (error, stack) {
+    _showGlobalErrorDialog("Async/Platform Error", error.toString(), stack.toString());
+    return true;
+  };
+
   runApp(const NeuralChatApp());
+}
+
+void _showGlobalErrorDialog(String title, String error, String stack) {
+  final context = navigatorKey.currentContext;
+  if (context != null) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF200B0B),
+        title: Text(title, style: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(error, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13)),
+              const Divider(color: Colors.red),
+              Text(stack, style: const TextStyle(color: Colors.white70, fontSize: 10, fontFamily: 'monospace')),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            child: const Text("Copy"),
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: "$error\n\n$stack"));
+            },
+          ),
+          ElevatedButton(
+            child: const Text("Close"),
+            onPressed: () => Navigator.pop(ctx),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 /* ========================================================================== */
@@ -123,10 +176,6 @@ class LearnedMemoryFact {
       );
 }
 
-/* ========================================================================== */
-/*                PERSISTENT COGNITIVE MEMORY ENGINE                          */
-/* ========================================================================== */
-
 class CognitiveMemoryBank {
   String personaOverview = "Helpful personal collaborator.";
   List<LearnedMemoryFact> facts = [];
@@ -170,6 +219,7 @@ class NeuralChatApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: navigatorKey,
       title: 'Neural Companion',
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
@@ -204,17 +254,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final CognitiveMemoryBank _memoryBank = CognitiveMemoryBank();
 
-  // Native GGUF Controller
   final LlamaController _llama = LlamaController();
 
-  // Voice & Audio
   final stt.SpeechToText _speech = stt.SpeechToText();
   final FlutterTts _tts = FlutterTts();
   bool _speechEnabled = false;
   bool _isListening = false;
   bool _voiceResponseEnabled = true;
 
-  // Model & State
   String? _loadedGgufPath;
   String _modelStatus = "No .gguf loaded";
   bool _isProcessing = false;
@@ -268,7 +315,7 @@ class _ChatScreenState extends State<ChatScreen> {
     await _tts.setVolume(1.0);
   }
 
-  /* ------------------- CRASH-PROOF MODEL SELECTOR & BINDER ------------------- */
+  /* ------------------- DIAGNOSTIC MODEL SELECTOR & BINDER ------------------- */
 
   Future<void> _selectGgufModel() async {
     try {
@@ -285,7 +332,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!file.name.toLowerCase().endsWith('.gguf')) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Please select a valid .gguf file")),
+            const SnackBar(content: Text("Selected file must end in .gguf")),
           );
         }
         return;
@@ -293,9 +340,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
       setState(() => _modelStatus = "Preparing model file...");
 
-      // Ensure native C++ has a real filesystem path:
-      // If the file is a content URI or not directly readable by fopen(),
-      // stream it into app's local sandbox storage where native C++ has guaranteed POSIX access.
       String finalPath = file.path;
       final bool isRealPosixFile = File(finalPath).existsSync();
 
@@ -304,7 +348,6 @@ class _ChatScreenState extends State<ChatScreen> {
         final appDir = await getApplicationDocumentsDirectory();
         final localFile = File('${appDir.path}/${file.name}');
 
-        // Stream copy to avoid 4GB RAM OOM during large GGUF transfers
         if (!await localFile.exists() || await localFile.length() != await file.length()) {
           await file.saveTo(localFile.path);
         }
@@ -315,29 +358,29 @@ class _ChatScreenState extends State<ChatScreen> {
       await prefs.setString('saved_gguf_path', finalPath);
 
       await _bindModel(finalPath);
-    } catch (e) {
+    } catch (e, stack) {
+      _showGlobalErrorDialog("File Selection Failed", e.toString(), stack.toString());
       if (mounted) {
-        setState(() => _modelStatus = "File access error");
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Failed to prepare model: $e")),
-        );
+        setState(() => _modelStatus = "File Error: $e");
       }
     }
   }
 
-
   Future<void> _bindModel(String path) async {
     try {
-      setState(() => _modelStatus = "Loading into memory...");
+      setState(() => _modelStatus = "Loading into RAM...");
 
       final file = File(path);
       if (!await file.exists()) {
-        setState(() => _modelStatus = "File not found on disk");
+        setState(() => _modelStatus = "File not found: $path");
         return;
       }
 
-      // Check RAM budget before native allocation:
-      // On 4GB RAM phones, contextSize > 2048 causes immediate kernel OOM killer
+      final int sizeBytes = await file.length();
+      final double sizeMB = sizeBytes / (1024 * 1024);
+
+      debugPrint("Starting llama.cpp native load: $path ($sizeMB MB)");
+
       await _llama.loadModel(
         modelPath: path,
         threads: 2,
@@ -351,20 +394,18 @@ class _ChatScreenState extends State<ChatScreen> {
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Model loaded: ${path.split('/').last}")),
+          SnackBar(content: Text("Model loaded successfully: ${path.split('/').last}")),
         );
       }
-    } catch (e) {
-      setState(() => _modelStatus = "Load failed: $e");
+    } catch (e, stack) {
+      _showGlobalErrorDialog("Model Binding Native Error", e.toString(), stack.toString());
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Model load failed: $e")),
-        );
+        setState(() => _modelStatus = "Load error: $e");
       }
     }
   }
 
-  /* ---------------- Inference Engine (4GB RAM Tuned) ---------------- */
+  /* ---------------- Inference Engine ---------------- */
 
   Future<String> _runGgufInference(
     String userText,
@@ -413,8 +454,9 @@ class _ChatScreenState extends State<ChatScreen> {
         (token) {
           outputBuffer.write(token);
         },
-        onError: (err) {
-          if (!completer.isCompleted) completer.complete("Inference error: $err");
+        onError: (err, stack) {
+          _showGlobalErrorDialog("Stream Token Error", err.toString(), stack.toString());
+          if (!completer.isCompleted) completer.complete("Error: $err");
         },
         onDone: () {
           if (!completer.isCompleted) {
@@ -432,7 +474,8 @@ class _ChatScreenState extends State<ChatScreen> {
               : "Response timed out under current hardware limits.";
         },
       );
-    } catch (e) {
+    } catch (e, stack) {
+      _showGlobalErrorDialog("Inference Failure", e.toString(), stack.toString());
       return "Execution halted: $e";
     }
   }
