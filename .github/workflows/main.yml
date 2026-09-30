@@ -19,85 +19,98 @@ jobs:
         working-directory: neural_companion
 
     steps:
-      # ---------------------------------------------------------
+
+      # =========================================================
       # CHECKOUT
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------------
+      # =========================================================
       # JAVA
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # ---------------------------------------------------------
+      # =========================================================
       # FLUTTER
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      # ---------------------------------------------------------
-      # SHOW ENVIRONMENT
-      # ---------------------------------------------------------
+      # =========================================================
+      # ENVIRONMENT
+      # =========================================================
       - name: Show Build Environment
         run: |
-          echo "========================================"
-          echo "BUILD ENVIRONMENT"
-          echo "========================================"
+          echo "::group::BUILD ENVIRONMENT"
 
-          flutter --version
-          dart --version
-
-          echo ""
-          echo "Project:"
+          echo "Working directory:"
           pwd
 
           echo ""
-          echo "Pubspec:"
-          grep -E "^(name|version|  file_picker:)" pubspec.yaml || true
-
-      # ---------------------------------------------------------
-      # FILE PICKER VERSION
-      # ---------------------------------------------------------
-      - name: Configure file_picker
-        run: |
-          echo "========================================"
-          echo "CONFIGURING FILE PICKER"
-          echo "========================================"
-
-          sed -i 's/file_picker: .*/file_picker: ^11.0.3/' pubspec.yaml
+          echo "Flutter:"
+          flutter --version
 
           echo ""
-          echo "Configured version:"
-          grep "file_picker:" pubspec.yaml
+          echo "Dart:"
+          dart --version
 
-      # ---------------------------------------------------------
+          echo ""
+          echo "Project files:"
+          ls -la
+
+          echo ""
+          echo "Pubspec dependency configuration:"
+          grep -E \
+            "^(name|version)|^[[:space:]]+(file_picker|fllama|flutter_tts):" \
+            pubspec.yaml || true
+
+          echo "::endgroup::"
+
+      # =========================================================
+      # CONFIGURE DEPENDENCIES
+      # =========================================================
+      - name: Configure Dependencies
+        run: |
+          echo "::group::CONFIGURING DEPENDENCIES"
+
+          # file_picker 11.x
+          sed -i \
+            's/^[[:space:]]*file_picker:.*/  file_picker: ^11.0.3/' \
+            pubspec.yaml
+
+          # fllama currently has only 0.0.1 on pub.dev.
+          sed -i \
+            's/^[[:space:]]*fllama:.*/  fllama: ^0.0.1/' \
+            pubspec.yaml
+
+          echo ""
+          echo "Updated dependency versions:"
+
+          grep -E \
+            "^[[:space:]]+(file_picker|fllama|flutter_tts):" \
+            pubspec.yaml
+
+          echo "::endgroup::"
+
+      # =========================================================
       # FIX FILE PICKER 11 API
-      #
-      # file_picker 11.x changed:
-      #
-      # OLD:
-      # FilePicker.platform.pickFiles()
-      #
-      # NEW:
-      # FilePicker.pickFiles()
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Fix FilePicker API
         run: |
-          echo "========================================"
-          echo "PATCHING FILE PICKER API"
-          echo "========================================"
+          echo "::group::PATCHING FILE PICKER API"
 
-          echo ""
-          echo "Occurrences BEFORE:"
-          grep -n "FilePicker\.platform\.pickFiles" lib/main.dart || true
+          echo "Old API occurrences:"
+          grep -n \
+            "FilePicker\.platform\.pickFiles" \
+            lib/main.dart || true
 
           python3 - <<'PY'
           from pathlib import Path
@@ -120,35 +133,19 @@ jobs:
           PY
 
           echo ""
-          echo "Occurrences AFTER:"
-          grep -n "FilePicker" lib/main.dart || true
+          echo "Remaining old API occurrences:"
+          grep -n \
+            "FilePicker\.platform\.pickFiles" \
+            lib/main.dart || true
 
-      # ---------------------------------------------------------
-      # VERIFY FILE PICKER API
-      # ---------------------------------------------------------
-      - name: Verify FilePicker API
-        run: |
-          echo "========================================"
-          echo "VERIFYING FILE PICKER API"
-          echo "========================================"
+          echo "::endgroup::"
 
-          if grep -n "FilePicker\.platform" lib/main.dart; then
-            echo ""
-            echo "ERROR: Old FilePicker.platform API still exists."
-            exit 1
-          fi
-
-          echo ""
-          echo "FilePicker API verified."
-
-      # ---------------------------------------------------------
+      # =========================================================
       # CLEAN
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Clean Flutter
         run: |
-          echo "========================================"
-          echo "CLEANING FLUTTER"
-          echo "========================================"
+          echo "::group::CLEANING FLUTTER"
 
           flutter clean
 
@@ -159,48 +156,74 @@ jobs:
           rm -rf ~/.gradle/caches
           rm -rf ~/.gradle/wrapper/dists
 
-      # ---------------------------------------------------------
+          echo "Clean completed."
+
+          echo "::endgroup::"
+
+      # =========================================================
       # GET DEPENDENCIES
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Get Dependencies
         run: |
-          echo "========================================"
-          echo "GETTING DEPENDENCIES"
-          echo "========================================"
+          echo "::group::GETTING DEPENDENCIES"
 
           rm -f pubspec.lock
 
-          flutter pub get
+          echo "Running flutter pub get..."
+          echo ""
 
-      # ---------------------------------------------------------
-      # VERIFY RESOLVED DEPENDENCIES
-      # ---------------------------------------------------------
-      - name: Verify Resolved Dependencies
-        run: |
-          echo "========================================"
-          echo "RESOLVED DEPENDENCIES"
-          echo "========================================"
+          set -o pipefail
 
-          flutter pub deps --style=compact | \
-            grep -E "file_picker|flutter_tts" || true
+          flutter pub get 2>&1 | tee /tmp/flutter-pub-get.log
+
+          result=${PIPESTATUS[0]}
 
           echo ""
-          echo "file_picker lock entry:"
-          grep -A6 -B2 "file_picker:" pubspec.lock || true
+          echo "flutter pub get exit code: $result"
 
-      # ---------------------------------------------------------
-      # PATCH FLUTTER_TTS FOR AGP 9
-      # ---------------------------------------------------------
+          if [ "$result" -ne 0 ]; then
+            echo ""
+            echo "::error::flutter pub get failed."
+            echo ""
+            echo "===== DEPENDENCY FAILURE ====="
+            cat /tmp/flutter-pub-get.log
+            echo "===== END DEPENDENCY FAILURE ====="
+            exit "$result"
+          fi
+
+          echo "::endgroup::"
+
+      # =========================================================
+      # VERIFY RESOLVED DEPENDENCIES
+      # =========================================================
+      - name: Verify Dependencies
+        run: |
+          echo "::group::RESOLVED DEPENDENCIES"
+
+          echo "fllama:"
+          grep -A8 -B2 "^  fllama:" pubspec.lock || true
+
+          echo ""
+          echo "file_picker:"
+          grep -A8 -B2 "^  file_picker:" pubspec.lock || true
+
+          echo ""
+          echo "flutter_tts:"
+          grep -A8 -B2 "^  flutter_tts:" pubspec.lock || true
+
+          echo "::endgroup::"
+
+      # =========================================================
+      # PATCH FLUTTER_TTS
+      # =========================================================
       - name: Patch flutter_tts for AGP 9
         run: |
+          echo "::group::PATCHING FLUTTER_TTS"
+
           TTS_BUILD="$HOME/.pub-cache/hosted/pub.dev/flutter_tts-4.2.5/android/build.gradle"
 
-          echo "========================================"
-          echo "PATCHING FLUTTER_TTS"
-          echo "========================================"
-
           if [ ! -f "$TTS_BUILD" ]; then
-            echo "ERROR: flutter_tts build.gradle not found:"
+            echo "::error::flutter_tts build.gradle was not found."
             echo "$TTS_BUILD"
             exit 1
           fi
@@ -257,14 +280,14 @@ jobs:
           print("flutter_tts patched successfully.")
           PY
 
-      # ---------------------------------------------------------
-      # PATCH OTHER FLUTTER PLUGINS FOR AGP 9
-      # ---------------------------------------------------------
+          echo "::endgroup::"
+
+      # =========================================================
+      # PATCH OTHER ANDROID PLUGINS
+      # =========================================================
       - name: Patch Other Android Plugins
         run: |
-          echo "========================================"
-          echo "CHECKING ANDROID FLUTTER PLUGINS"
-          echo "========================================"
+          echo "::group::PATCHING OTHER ANDROID PLUGINS"
 
           find "$HOME/.pub-cache/hosted/pub.dev" \
             -path "*/android/build.gradle" \
@@ -275,7 +298,6 @@ jobs:
                 "kotlin-android|org.jetbrains.kotlin.android|kotlinOptions" \
                 "$file"; then
 
-                echo ""
                 echo "Patching:"
                 echo "$file"
 
@@ -287,7 +309,6 @@ jobs:
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          # Remove old Kotlin Android plugin declarations.
           text = re.sub(
               r'^\s*apply plugin:\s*[\'"]kotlin-android[\'"].*$',
               '',
@@ -309,7 +330,6 @@ jobs:
               flags=re.MULTILINE
           )
 
-          # Remove obsolete kotlinOptions blocks.
           text = re.sub(
               r'\n\s*kotlinOptions\s*\{[^{}]*\}',
               '',
@@ -323,14 +343,16 @@ jobs:
               fi
           done
 
-      # ---------------------------------------------------------
-      # CONFIGURE PROJECT KOTLIN
-      # ---------------------------------------------------------
+          echo "Plugin patching completed."
+
+          echo "::endgroup::"
+
+      # =========================================================
+      # CONFIGURE KOTLIN
+      # =========================================================
       - name: Configure Kotlin
         run: |
-          echo "========================================"
-          echo "CONFIGURING KOTLIN"
-          echo "========================================"
+          echo "::group::CONFIGURING KOTLIN"
 
           if [ -f android/settings.gradle.kts ]; then
 
@@ -352,26 +374,27 @@ jobs:
 
           fi
 
-          echo ""
-          echo "Kotlin configuration:"
-          grep "org.jetbrains.kotlin.android" \
+          grep \
+            "org.jetbrains.kotlin.android" \
             android/settings.gradle.kts || true
 
-      # ---------------------------------------------------------
-      # AGP 9 CONFIGURATION
-      # ---------------------------------------------------------
+          echo "::endgroup::"
+
+      # =========================================================
+      # AGP 9 SETTINGS
+      # =========================================================
       - name: Configure Android Gradle
         run: |
-          echo "========================================"
-          echo "CONFIGURING ANDROID GRADLE"
-          echo "========================================"
+          echo "::group::CONFIGURING ANDROID GRADLE"
 
           touch android/gradle.properties
 
-          sed -i '/^android\.builtInKotlin=/d' \
+          sed -i \
+            '/^android\.builtInKotlin=/d' \
             android/gradle.properties
 
-          sed -i '/^android\.newDsl=/d' \
+          sed -i \
+            '/^android\.newDsl=/d' \
             android/gradle.properties
 
           echo "android.builtInKotlin=true" \
@@ -380,89 +403,139 @@ jobs:
           echo "android.newDsl=false" \
             >> android/gradle.properties
 
-          echo ""
           cat android/gradle.properties
 
-      # ---------------------------------------------------------
+          echo "::endgroup::"
+
+      # =========================================================
       # VERIFY FLUTTER_TTS
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Verify flutter_tts
         run: |
-          TTS_BUILD="$HOME/.pub-cache/hosted/pub.dev/flutter_tts-4.2.5/android/build.gradle"
+          echo "::group::VERIFYING FLUTTER_TTS"
 
-          echo "========================================"
-          echo "VERIFYING FLUTTER_TTS"
-          echo "========================================"
+          TTS_BUILD="$HOME/.pub-cache/hosted/pub.dev/flutter_tts-4.2.5/android/build.gradle"
 
           if grep -qE \
             "kotlin-android|org.jetbrains.kotlin.android" \
             "$TTS_BUILD"; then
 
-            echo "ERROR: Old Kotlin plugin still exists."
+            echo "::error::Old Kotlin plugin still exists in flutter_tts."
             exit 1
           fi
 
           if grep -q "kotlinOptions" "$TTS_BUILD"; then
-            echo "ERROR: Old kotlinOptions still exists."
+            echo "::error::Old kotlinOptions still exists in flutter_tts."
             exit 1
           fi
 
-          echo "flutter_tts AGP 9 patch verified."
+          echo "flutter_tts verification passed."
 
-      # ---------------------------------------------------------
+          echo "::endgroup::"
+
+      # =========================================================
       # DART ANALYSIS
-      #
-      # Catches Dart/API errors before the expensive Gradle build.
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Validate Dart Code
         run: |
-          echo "========================================"
-          echo "DART ANALYSIS"
-          echo "========================================"
+          echo "::group::DART ANALYSIS"
 
-          dart analyze --fatal-infos
+          set -o pipefail
 
-      # ---------------------------------------------------------
-      # BUILD RELEASE APK
-      # ---------------------------------------------------------
+          dart analyze --fatal-infos 2>&1 | tee /tmp/dart-analysis.log
+
+          result=${PIPESTATUS[0]}
+
+          echo ""
+          echo "Dart analysis exit code: $result"
+
+          if [ "$result" -ne 0 ]; then
+            echo "::error::Dart analysis failed."
+            echo ""
+            echo "===== DART ANALYSIS FAILURE ====="
+            cat /tmp/dart-analysis.log
+            echo "===== END DART ANALYSIS FAILURE ====="
+            exit "$result"
+          fi
+
+          echo "Dart analysis passed."
+
+          echo "::endgroup::"
+
+      # =========================================================
+      # BUILD APK
+      # =========================================================
       - name: Build Release APK
         run: |
-          echo "========================================"
-          echo "BUILDING RELEASE APK"
-          echo "========================================"
+          echo "::group::BUILDING RELEASE APK"
+
+          set -o pipefail
 
           flutter build apk \
             --release \
-            --android-skip-build-dependency-validation
+            --android-skip-build-dependency-validation \
+            2>&1 | tee /tmp/flutter-build.log
 
-      # ---------------------------------------------------------
+          result=${PIPESTATUS[0]}
+
+          echo ""
+          echo "Flutter build exit code: $result"
+
+          if [ "$result" -ne 0 ]; then
+            echo "::error::Flutter APK build failed."
+            echo ""
+            echo "===== APK BUILD FAILURE ====="
+            tail -n 300 /tmp/flutter-build.log
+            echo "===== END APK BUILD FAILURE ====="
+            exit "$result"
+          fi
+
+          echo "APK build completed successfully."
+
+          echo "::endgroup::"
+
+      # =========================================================
       # VERIFY APK
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Verify APK
         run: |
-          echo "========================================"
-          echo "APK GENERATED"
-          echo "========================================"
+          echo "::group::VERIFYING APK"
 
-          ls -lh build/app/outputs/flutter-apk/app-release.apk
+          APK="build/app/outputs/flutter-apk/app-release.apk"
 
-          test -f build/app/outputs/flutter-apk/app-release.apk
+          if [ ! -f "$APK" ]; then
+            echo "::error::APK was not generated."
+            exit 1
+          fi
 
-      # ---------------------------------------------------------
-      # COPY APK
-      # ---------------------------------------------------------
+          echo "APK:"
+          ls -lh "$APK"
+
+          echo "::endgroup::"
+
+      # =========================================================
+      # COPY APK TO REPOSITORY ROOT
+      # =========================================================
       - name: Copy APK
         run: |
-          cp build/app/outputs/flutter-apk/app-release.apk \
+          echo "::group::PREPARING RELEASE APK"
+
+          cp \
+            build/app/outputs/flutter-apk/app-release.apk \
             ../app-release-${GITHUB_REF_NAME}.apk
 
-      # ---------------------------------------------------------
-      # CREATE GITHUB RELEASE
-      # ---------------------------------------------------------
+          echo "Release APK:"
+          ls -lh ../app-release-${GITHUB_REF_NAME}.apk
+
+          echo "::endgroup::"
+
+      # =========================================================
+      # GITHUB RELEASE
+      # =========================================================
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: "Flutter APK ${{ github.ref_name }}"
           generate_release_notes: true
-          files: neural_companion/../app-release-${{ github.ref_name }}.apk
+          files: app-release-${{ github.ref_name }}.apk
