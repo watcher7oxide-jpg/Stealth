@@ -9,7 +9,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  llama_cpp_dart: ^0.1.7
+  llama_cpp_dart: ^0.2.2
   speech_to_text: ^7.5.0
   flutter_tts: ^4.0.2
   file_picker: ^8.1.2         # Updated to ensure web ^1.0 compatibility
