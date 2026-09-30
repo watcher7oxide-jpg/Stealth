@@ -17,10 +17,13 @@ jobs:
   build:
     name: Build Flutter APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -34,40 +37,48 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Detect Project Directory
-        id: dir_check
+      - name: Locate Project Root
+        id: locate_dir
         run: |
           if [ -f "pubspec.yaml" ]; then
             echo "TARGET_DIR=." >> $GITHUB_ENV
           elif [ -f "neural_companion/pubspec.yaml" ]; then
             echo "TARGET_DIR=neural_companion" >> $GITHUB_ENV
           else
-            echo "::error::Could not find pubspec.yaml in root or neural_companion/"
+            echo "::error::pubspec.yaml was not found in root or neural_companion/!"
             exit 1
           fi
 
-      - name: Print Environment
+      - name: Verify Environment
         working-directory: ${{ env.TARGET_DIR }}
         run: |
-          echo "Target Directory: $PWD"
+          echo "Current working directory: $PWD"
           flutter --version
           dart --version
 
-      - name: Fetch Dependencies
+      - name: Fetch Dependencies (Verbose)
         working-directory: ${{ env.TARGET_DIR }}
+        timeout-minutes: 10
+        env:
+          GIT_TERMINAL_PROMPT: 0
         run: |
-          flutter clean
-          flutter pub get
+          echo "Clearing stale locks and caches..."
+          rm -f pubspec.lock
+          rm -rf .dart_tool
 
-      - name: Dart Analyze
+          echo "Running flutter pub get with real-time logs..."
+          flutter pub get --verbose
+
+      - name: Analyze Dart Code
         working-directory: ${{ env.TARGET_DIR }}
         run: |
-          dart analyze --no-fatal-infos
+          dart analyze
 
       - name: Build Release APK
         working-directory: ${{ env.TARGET_DIR }}
+        timeout-minutes: 15
         run: |
-          flutter build apk --release
+          flutter build apk --release --verbose
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
