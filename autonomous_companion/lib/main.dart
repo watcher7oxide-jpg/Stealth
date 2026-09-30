@@ -160,7 +160,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final ScrollController _scrollController = ScrollController();
 
   // On-Device Local Engine
-  LlamaProcessor? _engine;
+  Llama? _engine;
   String? _loadedModelPath;
   bool _isModelLoading = false;
 
@@ -192,7 +192,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _textController.dispose();
     _scrollController.dispose();
     _tts.stop();
-    _engine?.unloadModel();
+    _engine?.dispose();
     super.dispose();
   }
 
@@ -258,24 +258,31 @@ class _ChatScreenState extends State<ChatScreen> {
 
     try {
       // Free old engine if already loaded
-      _engine?.unloadModel();
+      _engine?.dispose();
+
+      // Ensure dynamic library is bound on Android
+      if (Platform.isAndroid && Llama.libraryPath == null) {
+        Llama.libraryPath = 'libllama.so';
+      }
 
       // Configure strictly for 4 GB RAM:
-      // - contextSize: 1024 tokens (prevents KV cache explosion)
-      // - threads: 4 (uses CPU efficiency/performance balance)
-      final modelParams = ModelParams();
+      // - nCtx: 1024 tokens (prevents KV cache memory spikes)
+      // - nThreads: 4 (balances performance cores without thermal throttling)
+      final modelParams = ModelParams()..nGpuLayers = 0;
       final contextParams = ContextParams()
-        ..context = 1024
+        ..nCtx = 1024
         ..nThreads = 4;
+      final samplerParams = SamplerParams()..temp = 0.7;
 
-      final processor = LlamaProcessor(
+      final llama = Llama(
         path,
         modelParams,
         contextParams,
+        samplerParams,
       );
 
       setState(() {
-        _engine = processor;
+        _engine = llama;
         _loadedModelPath = path;
         _isModelLoading = false;
       });
@@ -380,15 +387,20 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToBottom();
 
     try {
-      // Build lightweight prompt with injected persistent memory
       final prompt = _buildContextPrompt(userMessage);
 
-      // Execute on-device generation
       final responseBuffer = StringBuffer();
-      final stream = _engine!.prompt(prompt);
+      _engine!.setPrompt(prompt);
 
-      await for (final token in stream) {
-        responseBuffer.write(token);
+      // Stream generation loop using Dart Records
+      while (true) {
+        final (token, done) = _engine!.getNext();
+        if (token.isNotEmpty) {
+          responseBuffer.write(token);
+        }
+        if (done) break;
+        // Yield to Flutter event loop so UI stays smooth
+        await Future.delayed(const Duration(milliseconds: 1));
       }
 
       final aiResponseText = responseBuffer.toString().trim();
@@ -426,7 +438,6 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String _buildContextPrompt(ChatMessage msg) {
-    // Keep context compact for 4 GB RAM limits
     final memoryContext = [
       if (_memory.learnedFacts.isNotEmpty)
         "Known Facts: ${_memory.learnedFacts.take(5).join('; ')}",
@@ -447,19 +458,18 @@ class _ChatScreenState extends State<ChatScreen> {
         "<start_of_turn>model\n";
   }
 
-  // Autonomous Memory Engine: Analyzes interaction and extracts permanent traits
   void _shapeMemoryContinuously(ChatMessage userMsg, String reply) {
     Future.microtask(() {
       bool updated = false;
 
-      // Extract explicit preferences or declarations
       final input = userMsg.text.toLowerCase();
-      if (input.contains("my name is") || input.contains("i like") || input.contains("i work as")) {
+      if (input.contains("my name is") ||
+          input.contains("i like") ||
+          input.contains("i work as")) {
         _memory.learnedFacts.add(userMsg.text);
         updated = true;
       }
 
-      // Catalog attachments into memory
       for (var att in userMsg.attachments) {
         final fact = "User referenced file: ${att.name}";
         if (!_memory.learnedFacts.contains(fact)) {
@@ -506,7 +516,8 @@ class _ChatScreenState extends State<ChatScreen> {
         final jsonString = await file.readAsString();
         final Map<String, dynamic> data = jsonDecode(jsonString);
 
-        if (data.containsKey('learnedFacts') && data.containsKey('personaStyle')) {
+        if (data.containsKey('learnedFacts') &&
+            data.containsKey('personaStyle')) {
           setState(() {
             _memory = MemorySnapshot.fromJson(data);
           });
@@ -644,7 +655,6 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
 
-          // Action input bar
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
             decoration: BoxDecoration(
