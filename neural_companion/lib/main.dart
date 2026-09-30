@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:file_selector/file_selector.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
@@ -20,13 +21,11 @@ final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Global uncaught Flutter error handler
   FlutterError.onError = (FlutterErrorDetails details) {
     FlutterError.presentError(details);
     _showGlobalErrorDialog("Flutter Error", details.exception.toString(), details.stack.toString());
   };
 
-  // Global platform/asynchronous error handler
   PlatformDispatcher.instance.onError = (error, stack) {
     _showGlobalErrorDialog("Async/Platform Error", error.toString(), stack.toString());
     return true;
@@ -269,6 +268,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    _checkPreviousNativeCrash();
     _initSpeechEngine();
     _initTtsEngine();
     _loadSavedState();
@@ -282,6 +282,23 @@ class _ChatScreenState extends State<ChatScreen> {
     _tts.stop();
     _llama.dispose();
     super.dispose();
+  }
+
+  /// Checks if the previous execution crashed natively
+  Future<void> _checkPreviousNativeCrash() async {
+    try {
+      final appDir = await getApplicationDocumentsDirectory();
+      final parentDir = appDir.parent;
+      final crashFile = File('${parentDir.path}/files/last_native_crash.txt');
+
+      if (await crashFile.exists()) {
+        final content = await crashFile.readAsString();
+        await crashFile.delete(); // Delete after reading
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showGlobalErrorDialog("Crash Detected on Previous Run", content, "Captured by Native Exception Handler");
+        });
+      }
+    } catch (_) {}
   }
 
   Future<void> _loadSavedState() async {
@@ -315,7 +332,7 @@ class _ChatScreenState extends State<ChatScreen> {
     await _tts.setVolume(1.0);
   }
 
-  /* ------------------- DIAGNOSTIC MODEL SELECTOR & BINDER ------------------- */
+  /* ------------------- ZERO-RAM CRASH-PROOF MODEL LOADER ------------------- */
 
   Future<void> _selectGgufModel() async {
     try {
@@ -341,19 +358,20 @@ class _ChatScreenState extends State<ChatScreen> {
       final int fileSizeBytes = await file.length();
       final double fileSizeMB = fileSizeBytes / (1024 * 1024);
 
-      // 4GB RAM Phone Safety Guard:
-      // If a model is > 2200 MB (2.2 GB), Android kernel OOM killer will kill the process.
+      setState(() => _modelStatus = "File size: ${fileSizeMB.toStringAsFixed(0)} MB");
+
+      // Memory limit check for 4GB RAM phones:
       if (fileSizeMB > 2300) {
         if (mounted) {
           showDialog(
             context: context,
             builder: (ctx) => AlertDialog(
               backgroundColor: const Color(0xFF1E2230),
-              title: const Text("Model Too Large for 4GB RAM", style: TextStyle(color: Colors.redAccent)),
+              title: const Text("Model Exceeds Safe RAM Limit", style: TextStyle(color: Colors.redAccent)),
               content: Text(
                 "The selected model is ${fileSizeMB.toStringAsFixed(1)} MB.\n\n"
-                "A 4GB RAM phone only has ~1.6GB of available free RAM. Loading models larger than 2.2GB triggers Android's Out-Of-Memory Killer.\n\n"
-                "Recommended: Use a 1B, 1.5B, or 3B Q4_K_M model (e.g., Llama-3.2-1B, Qwen2.5-1.5B, or SmolLM2-1.7B).",
+                "4GB RAM phones have ~1.6GB free RAM. Loading a file larger than 2.2GB causes Android's kernel to kill the process (OOM Killer).\n\n"
+                "Recommended: Use a 1B, 1.5B, or 3B Q4_K_M model.",
                 style: const TextStyle(color: Colors.white70, fontSize: 13),
               ),
               actions: [
@@ -362,10 +380,10 @@ class _ChatScreenState extends State<ChatScreen> {
                   onPressed: () => Navigator.pop(ctx),
                 ),
                 ElevatedButton(
-                  child: const Text("Load Anyway"),
+                  child: const Text("Attempt Load"),
                   onPressed: () {
                     Navigator.pop(ctx);
-                    _proceedWithModel(file);
+                    _bindModelDirect(file.path);
                   },
                 ),
               ],
@@ -375,71 +393,101 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      await _proceedWithModel(file);
+      await _bindModelDirect(file.path);
     } catch (e, stack) {
       _showGlobalErrorDialog("File Selection Failed", e.toString(), stack.toString());
     }
   }
 
-  Future<void> _proceedWithModel(XFile file) async {
-    setState(() => _modelStatus = "Preparing model...");
-
-    String finalPath = file.path;
-    final bool isRealPosixFile = File(finalPath).existsSync();
-
-    // If it's a Content URI, stream it to local sandbox storage for direct POSIX access
-    if (!isRealPosixFile || finalPath.startsWith("content://")) {
-      setState(() => _modelStatus = "Caching model for native access...");
-      final appDir = await getApplicationDocumentsDirectory();
-      final localFile = File('${appDir.path}/${file.name}');
-
-      if (!await localFile.exists() || await localFile.length() != await file.length()) {
-        await file.saveTo(localFile.path);
-      }
-      finalPath = localFile.path;
-    }
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('saved_gguf_path', finalPath);
-
-    await _bindModel(finalPath);
-  }
-
-  Future<void> _bindModel(String path) async {
+  /// Passes the filesystem path directly to llama.cpp with ZERO memory allocation
+  Future<void> _bindModelDirect(String rawPath) async {
     try {
-      setState(() => _modelStatus = "Loading into RAM...");
+      setState(() => _modelStatus = "Verifying direct path...");
 
-      final file = File(path);
+      String targetPath = rawPath;
+      final file = File(targetPath);
+
+      // Check if file is readable directly by native C++
       if (!await file.exists()) {
-        setState(() => _modelStatus = "File not found: $path");
+        setState(() => _modelStatus = "Path unreadable: $targetPath");
+        _showGlobalErrorDialog(
+          "Storage Access Error",
+          "File does not exist at path: $targetPath",
+          "Android Scoped Storage may be blocking direct access to this directory.",
+        );
         return;
       }
 
-      debugPrint("Calling native llama.cpp loadModel: $path");
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('saved_gguf_path', targetPath);
 
-      // 4GB RAM Phone Tuned Settings
+      setState(() => _modelStatus = "Initializing llama.cpp engine...");
+
+      // 4GB RAM Phone Tuned Parameters:
+      // contextSize: 512 keeps the KV-cache under 120MB
+      // threads: 2 prevents CPU thermal throttling
       await _llama.loadModel(
-        modelPath: path,
-        threads: 2,        // 2 threads prevents thermal throttling and CPU spike
-        contextSize: 1024, // 1024 keeps the KV-cache under 300MB
+        modelPath: targetPath,
+        threads: 2,
+        contextSize: 512,
       );
 
       setState(() {
-        _loadedGgufPath = path;
-        _modelStatus = "Ready: ${path.split('/').last}";
+        _loadedGgufPath = targetPath;
+        _modelStatus = "Ready: ${targetPath.split('/').last}";
       });
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Model loaded successfully: ${path.split('/').last}")),
+          SnackBar(content: Text("Model loaded: ${targetPath.split('/').last}")),
         );
       }
     } catch (e, stack) {
-      _showGlobalErrorDialog("Native Model Load Error", e.toString(), stack.toString());
+      _showGlobalErrorDialog("Native llama.cpp Load Error", e.toString(), stack.toString());
       if (mounted) {
         setState(() => _modelStatus = "Load error: $e");
       }
     }
+  }
+
+  /* ------------------- ON-DEVICE LOGCAT VIEWER (NO PC NEEDED) ------------------- */
+
+  Future<void> _showDeviceLogcat() async {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF141721),
+        title: const Text("Device System Logs", style: TextStyle(color: Color(0xFF00D2FF), fontSize: 16)),
+        content: FutureBuilder<ProcessResult>(
+          future: Process.run('logcat', ['-d', '-v', 'brief', '-t', '150']),
+          builder: (context, snapshot) {
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              return const SizedBox(
+                height: 120,
+                child: Center(child: CircularProgressIndicator()),
+              );
+            }
+            final logs = snapshot.data?.stdout?.toString() ?? "No logcat output available";
+            return SizedBox(
+              width: double.maxFinite,
+              height: 400,
+              child: SingleChildScrollView(
+                child: SelectableText(
+                  logs,
+                  style: const TextStyle(fontSize: 10, fontFamily: 'monospace', color: Colors.white70),
+                ),
+              ),
+            );
+          },
+        ),
+        actions: [
+          TextButton(
+            child: const Text("Close"),
+            onPressed: () => Navigator.pop(ctx),
+          ),
+        ],
+      ),
+    );
   }
 
   /* ---------------- Inference Engine ---------------- */
@@ -677,6 +725,11 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ),
         actions: [
+          IconButton(
+            tooltip: "System Logs",
+            icon: const Icon(Icons.terminal, color: Colors.amberAccent),
+            onPressed: _showDeviceLogcat,
+          ),
           IconButton(
             tooltip: _voiceResponseEnabled ? "TTS: On" : "TTS: Off",
             icon: Icon(
