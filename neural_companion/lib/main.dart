@@ -10,7 +10,6 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 void main() async {
@@ -147,13 +146,11 @@ class CognitiveMemoryBank {
     }
   }
 
-  // Optimized compact system context to preserve RAM & token budget
   String buildSystemContext() {
     final buffer = StringBuffer();
     buffer.write("System: You are an autonomous AI companion. ");
     if (facts.isNotEmpty) {
       buffer.write("Known facts: ");
-      // Only inject top 10 most recent facts to prevent KV cache blowup on 4GB RAM
       for (final f in facts.take(10)) {
         buffer.write("[${f.fact}] ");
       }
@@ -235,8 +232,6 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
-  /* ---------------- Init & State Loading ---------------- */
-
   Future<void> _loadSavedState() async {
     final prefs = await SharedPreferences.getInstance();
     final savedPath = prefs.getString('saved_gguf_path');
@@ -271,16 +266,13 @@ class _ChatScreenState extends State<ChatScreen> {
     await _tts.setVolume(1.0);
   }
 
-  /* ---------------- GGUF Model Selector ---------------- */
-
   Future<void> _selectGgufModel() async {
     try {
-      final result = await FilePicker.platform.pickFiles(
+      final result = await FilePicker.pickFiles(
         type: FileType.any,
-        allowMultiple: false,
       );
 
-      if (result != null && result.files.single.path != null) {
+      if (result != null && result.files.isNotEmpty && result.files.single.path != null) {
         final path = result.files.single.path!;
         if (!path.toLowerCase().endsWith('.gguf')) {
           if (mounted) {
@@ -321,15 +313,13 @@ class _ChatScreenState extends State<ChatScreen> {
     List<AttachmentItem> attachments,
   ) async {
     if (_loadedGgufPath == null || !File(_loadedGgufPath!).existsSync()) {
-      return "No .gguf model selected. Tap the chip in the top bar to locate your downloaded file.";
+      return "No .gguf model selected. Tap the header to select your model file.";
     }
 
-    // Build context
     final systemPrompt = _memoryBank.buildSystemContext();
     final StringBuffer promptBuffer = StringBuffer();
     promptBuffer.writeln(systemPrompt);
 
-    // Keep context history minimal (last 3 messages) for 4GB RAM phones
     final recent = _messages.length > 3
         ? _messages.sublist(_messages.length - 3)
         : _messages;
@@ -337,7 +327,6 @@ class _ChatScreenState extends State<ChatScreen> {
       promptBuffer.writeln("${m.isUser ? 'User' : 'Assistant'}: ${m.text}");
     }
 
-    // Process attachment text (truncated to 200 chars to avoid memory exhaustion)
     for (final a in attachments) {
       if (a.bytes != null && !a.isImage && a.size < 50000) {
         try {
@@ -356,20 +345,19 @@ class _ChatScreenState extends State<ChatScreen> {
     final StringBuffer responseBuffer = StringBuffer();
 
     try {
-      // 4GB RAM Optimization Settings:
-      // contextSize: 1024 (prevents KV cache OOM)
-      // threads: 2 (avoids CPU throttling and stack memory spikes)
-      await fllama.chat(
-        ChatRequest(
-          modelPath: _loadedGgufPath!,
-          messages: [
-            Message(Role.user, promptBuffer.toString()),
-          ],
-          contextSize: 1024,
-          threads: 2,
-          numGpuLayers: 0, // Fallback purely to optimized CPU/NEON instructions
-          temperature: 0.7,
-        ),
+      final request = OpenAiRequest(
+        modelPath: _loadedGgufPath!,
+        messages: [
+          OpenAiChatMessage(Role.user, promptBuffer.toString()),
+        ],
+        contextSize: 1024,
+        threads: 2,
+        numGpuLayers: 0,
+        temperature: 0.7,
+      );
+
+      fllamaChat(
+        request,
         (response, done) {
           responseBuffer.write(response);
           if (done && !completer.isCompleted) {
@@ -382,14 +370,12 @@ class _ChatScreenState extends State<ChatScreen> {
         const Duration(seconds: 45),
         onTimeout: () => responseBuffer.isNotEmpty
             ? responseBuffer.toString()
-            : "Response timed out on current hardware limits.",
+            : "Response timed out under current hardware limits.",
       );
     } catch (e) {
       return "Execution halted: $e. Ensure other background apps are closed to free RAM.";
     }
   }
-
-  /* ---------------- Continuous Memory & Background Induction ---------------- */
 
   void _triggerSimultaneousLearning(
     String userPrompt,
@@ -424,7 +410,6 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
 
-      // Memory cap of 50 facts to prevent excessive storage or token ingestion
       if (_memoryBank.facts.length > 50) {
         _memoryBank.facts = _memoryBank.facts.sublist(0, 50);
       }
@@ -456,8 +441,6 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } catch (_) {}
   }
-
-  /* ---------------- Voice & Messaging Handlers ---------------- */
 
   void _toggleListening() async {
     if (!_speechEnabled) return;
@@ -499,7 +482,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _scrollToBottom();
 
-    // Run inference using the selected GGUF file
     final replyText = await _runGgufInference(text, outgoingAttachments);
 
     final aiMsg = ChatMessage(
@@ -534,8 +516,6 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     });
   }
-
-  /* ---------------- UI Construction ---------------- */
 
   @override
   Widget build(BuildContext context) {
@@ -627,8 +607,7 @@ class _ChatScreenState extends State<ChatScreen> {
             IconButton(
               icon: const Icon(Icons.attach_file, color: Colors.white70),
               onPressed: () async {
-                final res = await FilePicker.platform.pickFiles(
-                  allowMultiple: true,
+                final res = await FilePicker.pickFiles(
                   withData: true,
                 );
                 if (res != null) {
@@ -662,7 +641,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: const TextStyle(color: Colors.white),
                 decoration: InputDecoration(
                   hintText: _isListening ? "Listening..." : "Type instruction...",
-                  hintStyle: TextStyle(color: Colors.white.withOpacity(0.3)),
+                  hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.3)),
                   filled: true,
                   fillColor: const Color(0xFF1E2230),
                   contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
@@ -720,12 +699,12 @@ class _ChatScreenState extends State<ChatScreen> {
                       icon: const Icon(Icons.download),
                       label: const Text("Import Memory"),
                       onPressed: () async {
-                        final res = await FilePicker.platform.pickFiles(
+                        final res = await FilePicker.pickFiles(
                           type: FileType.custom,
                           allowedExtensions: ['json'],
                           withData: true,
                         );
-                        if (res != null && res.files.single.bytes != null) {
+                        if (res != null && res.files.isNotEmpty && res.files.single.bytes != null) {
                           final data = jsonDecode(utf8.decode(res.files.single.bytes!));
                           setState(() => _memoryBank.importFromJson(data));
                           await _saveMemoryToDisk();
