@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.neural_companion" // Match your package name
+    namespace = "com.example.neural_companion"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -19,7 +19,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.neural_companion" // Match your package name
+        applicationId = "com.example.neural_companion"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
