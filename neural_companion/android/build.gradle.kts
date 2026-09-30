@@ -1,38 +1,52 @@
-plugins {
-    id("com.android.application")
-    id("kotlin-android")
-    id("dev.flutter.flutter-gradle-plugin")
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
 }
 
-android {
-    namespace = "com.example.neural_companion"
-    compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+val newBuildDir: Directory = rootProject.layout.buildDirectory.dir("../../build").get()
+rootProject.layout.buildDirectory.value(newBuildDir)
 
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+subprojects {
+    val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
+    project.layout.buildDirectory.value(newSubprojectBuildDir)
+}
+
+subprojects {
+    project.evaluationDependsOn(":app")
+
+    configurations.all {
+        resolutionStrategy {
+            force("androidx.core:core:1.13.1")
+        }
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    afterEvaluate {
+        if (extensions.findByName("android") != null) {
+            extensions.configure<com.android.build.gradle.BaseExtension> {
+                if (namespace == null) {
+                    namespace = project.group.toString()
+                }
 
-    defaultConfig {
-        applicationId = "com.example.neural_companion"
-        minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
-        versionCode = flutter.versionCode
-        versionName = flutter.versionName
-    }
+                lintOptions {
+                    isAbortOnError = false
+                    isCheckReleaseBuilds = false
+                }
+            }
+        }
 
-    buildTypes {
-        release {
-            signingConfig = signingConfigs.getByName("debug")
+        tasks.configureEach {
+            if (
+                name.contains("Lint", ignoreCase = true) ||
+                name.contains("AarMetadata", ignoreCase = true)
+            ) {
+                enabled = false
+            }
         }
     }
 }
 
-flutter {
-    source = "../.."
+tasks.register<Delete>("clean") {
+    delete(rootProject.layout.buildDirectory)
 }
