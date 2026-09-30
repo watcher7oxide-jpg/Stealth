@@ -31,7 +31,7 @@ void main() async {
     );
   };
 
-  // Catch unhandled asynchronous / platform errors
+  // Catch unhandled asynchronous/platform errors
   PlatformDispatcher.instance.onError = (error, stack) {
     _showGlobalErrorDialog(
       "Async Platform Error",
@@ -263,10 +263,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final CognitiveMemoryBank _memoryBank = CognitiveMemoryBank();
 
-  // Native GGUF Inference Controller
+  // Native GGUF Controller
   final LlamaController _llama = LlamaController();
 
-  // Audio / STT / TTS
+  // Audio & Voice
   final stt.SpeechToText _speech = stt.SpeechToText();
   final FlutterTts _tts = FlutterTts();
   bool _speechEnabled = false;
@@ -277,6 +277,10 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _loadedGgufPath;
   String _modelStatus = "No .gguf loaded";
   bool _isProcessing = false;
+
+  // Native MethodChannel for Large File Picking
+  static const MethodChannel _pickerChannel =
+      MethodChannel('com.example.neural_companion/file_picker');
 
   @override
   void initState() {
@@ -348,7 +352,7 @@ class _ChatScreenState extends State<ChatScreen> {
     await _tts.setVolume(1.0);
   }
 
-  /* ------------------- ZERO-RAM CRASH-PROOF MODEL LOADER ------------------- */
+  /* ------------------- 64-BIT NATIVE GGUF MODEL SELECTOR ------------------- */
 
   Future<void> _selectGgufModel() async {
     if (kIsWeb) {
@@ -361,32 +365,36 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     try {
-      const typeGroup = XTypeGroup(
-        label: 'GGUF Models',
-        extensions: ['gguf'],
-      );
-      final XFile? file = await openFile(
-        acceptedTypeGroups: const [typeGroup],
-      );
+      setState(() => _modelStatus = "Opening native picker...");
 
-      if (file == null) return;
+      // Calls our 64-bit native Android picker (bypasses file_selector's 2GB bug and heap OOM)
+      final String? selectedPath =
+          await _pickerChannel.invokeMethod<String>('pickGgufFile');
 
-      if (!file.name.toLowerCase().endsWith('.gguf')) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Selected file must end in .gguf")),
-          );
-        }
+      if (selectedPath == null || selectedPath.isEmpty) {
+        setState(() => _modelStatus = _loadedGgufPath != null
+            ? "Ready: ${_loadedGgufPath!.split('/').last}"
+            : "No .gguf loaded");
+        return;
+      }
+
+      final file = File(selectedPath);
+      if (!await file.exists()) {
+        _showGlobalErrorDialog(
+          "File Error",
+          "File path not accessible: $selectedPath",
+          "Check storage permissions.",
+        );
         return;
       }
 
       final int fileSizeBytes = await file.length();
       final double fileSizeMB = fileSizeBytes / (1024 * 1024);
 
-      setState(() => _modelStatus = "File size: ${fileSizeMB.toStringAsFixed(0)} MB");
+      setState(() => _modelStatus = "Model size: ${fileSizeMB.toStringAsFixed(0)} MB");
 
-      // Guard against kernel OOM kill on 4GB RAM devices:
-      if (fileSizeMB > 2400) {
+      // Memory limit safety check for 4GB RAM phones:
+      if (fileSizeMB > 2300) {
         if (mounted) {
           showDialog(
             context: context,
@@ -395,8 +403,8 @@ class _ChatScreenState extends State<ChatScreen> {
               title: const Text("Model Exceeds Safe RAM Limit", style: TextStyle(color: Colors.redAccent)),
               content: Text(
                 "The selected model is ${fileSizeMB.toStringAsFixed(1)} MB.\n\n"
-                "4GB RAM phones have ~1.6GB free RAM. Loading files larger than 2.2GB causes Android's Linux kernel to kill the process (OOM Killer).\n\n"
-                "Recommended: Use a 1B, 1.5B, or 3B Q4_K_M model (e.g. Llama-3.2-1B, Qwen2.5-1.5B, SmolLM2-1.7B).",
+                "A 4GB RAM phone has ~1.6GB free RAM. Loading models larger than 2.2GB causes the kernel to kill the process (OOM Killer).\n\n"
+                "Recommended: Use a 1B, 1.5B, or 3B Q4_K_M model.",
                 style: const TextStyle(color: Colors.white70, fontSize: 13),
               ),
               actions: [
@@ -408,7 +416,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   child: const Text("Attempt Load"),
                   onPressed: () {
                     Navigator.pop(ctx);
-                    _bindModel(file.path);
+                    _bindModel(selectedPath);
                   },
                 ),
               ],
@@ -418,13 +426,13 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      await _bindModel(file.path);
+      await _bindModel(selectedPath);
     } catch (e, stack) {
-      _showGlobalErrorDialog("File Selection Failed", e.toString(), stack.toString());
+      _showGlobalErrorDialog("Model Selection Error", e.toString(), stack.toString());
     }
   }
 
-  /// Passes the filesystem path directly to llama.cpp with ZERO heap memory allocation
+  /// Passes the filesystem path directly to llama.cpp with ZERO memory allocation
   Future<void> _bindModel(String rawPath) async {
     try {
       setState(() => _modelStatus = "Verifying direct path...");
@@ -445,7 +453,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
       setState(() => _modelStatus = "Initializing llama.cpp engine...");
 
-      // 4GB RAM Tuned Settings:
+      // 4GB RAM Phone Tuned Parameters:
       // contextSize: 512 keeps the KV-cache under 120MB
       // threads: 2 prevents thermal throttling and CPU spike
       await _llama.loadModel(
