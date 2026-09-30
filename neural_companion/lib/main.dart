@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:llama_flutter_android/llama_flutter_android.dart' hide ChatMessage;
@@ -287,12 +287,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _selectGgufModel() async {
     try {
-      final result = await FilePicker.pickFiles(
-        type: FileType.any,
+      const typeGroup = XTypeGroup(
+        label: 'GGUF Models',
+        extensions: ['gguf'],
+      );
+      final XFile? file = await openFile(
+        acceptedTypeGroups: const [typeGroup],
       );
 
-      if (result != null && result.files.isNotEmpty && result.files.single.path != null) {
-        final path = result.files.single.path!;
+      if (file != null) {
+        final path = file.path;
         if (!path.toLowerCase().endsWith('.gguf')) {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -309,7 +313,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Model bound: ${path.split('/').last}")),
+            SnackBar(content: Text("Model bound: ${file.name}")),
           );
         }
       }
@@ -625,24 +629,26 @@ class _ChatScreenState extends State<ChatScreen> {
             IconButton(
               icon: const Icon(Icons.attach_file, color: Colors.white70),
               onPressed: () async {
-                final res = await FilePicker.pickFiles(
-                  withData: true,
-                );
-                if (res != null) {
-                  setState(() {
-                    for (final f in res.files) {
+                final List<XFile> files = await openFiles();
+                if (files.isNotEmpty) {
+                  for (final f in files) {
+                    final bytes = await f.readAsBytes();
+                    final size = await f.length();
+                    final ext =
+                        f.name.contains('.') ? f.name.split('.').last : '';
+                    setState(() {
                       _selectedAttachments.add(
                         AttachmentItem(
                           id: DateTime.now().millisecondsSinceEpoch.toString(),
                           name: f.name,
-                          path: f.path ?? '',
-                          size: f.size,
-                          extension: f.extension ?? '',
-                          bytes: f.bytes,
+                          path: f.path,
+                          size: size,
+                          extension: ext,
+                          bytes: bytes,
                         ),
                       );
-                    }
-                  });
+                    });
+                  }
                 }
               },
             ),
@@ -717,13 +723,16 @@ class _ChatScreenState extends State<ChatScreen> {
                       icon: const Icon(Icons.download),
                       label: const Text("Import Memory"),
                       onPressed: () async {
-                        final res = await FilePicker.pickFiles(
-                          type: FileType.custom,
-                          allowedExtensions: ['json'],
-                          withData: true,
+                        const jsonTypeGroup = XTypeGroup(
+                          label: 'JSON Files',
+                          extensions: ['json'],
                         );
-                        if (res != null && res.files.isNotEmpty && res.files.single.bytes != null) {
-                          final data = jsonDecode(utf8.decode(res.files.single.bytes!));
+                        final XFile? file = await openFile(
+                          acceptedTypeGroups: const [jsonTypeGroup],
+                        );
+                        if (file != null) {
+                          final bytes = await file.readAsBytes();
+                          final data = jsonDecode(utf8.decode(bytes));
                           setState(() => _memoryBank.importFromJson(data));
                           await _saveMemoryToDisk();
                           if (ctx.mounted) {
