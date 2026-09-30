@@ -2,12 +2,8 @@ name: Build Flutter APK Release
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
       - "v*.*.*"
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -17,16 +13,16 @@ jobs:
   build:
     name: Build Flutter APK
     runs-on: ubuntu-latest
-    timeout-minutes: 25
 
-    env:
-      TERM: dumb
+    defaults:
+      run:
+        working-directory: neural_companion
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -38,43 +34,26 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Locate Project Root
-        id: locate_dir
-        run: |
-          if [ -f "pubspec.yaml" ]; then
-            echo "TARGET_DIR=." >> $GITHUB_ENV
-          elif [ -f "neural_companion/pubspec.yaml" ]; then
-            echo "TARGET_DIR=neural_companion" >> $GITHUB_ENV
-          else
-            echo "::error::pubspec.yaml was not found!"
-            exit 1
-          fi
-
-      - name: Fetch Dependencies
-        working-directory: ${{ env.TARGET_DIR }}
-        run: |
-          flutter pub get
-
-      - name: Analyze Dart Code
-        working-directory: ${{ env.TARGET_DIR }}
-        run: |
-          dart analyze
+      - name: Get Dependencies
+        run: flutter pub get
 
       - name: Build Release APK
-        working-directory: ${{ env.TARGET_DIR }}
+        run: flutter build apk --release
+
+      - name: Verify APK
         run: |
-          flutter build apk --release
+          echo "APK generated:"
+          ls -lh build/app/outputs/flutter-apk/app-release.apk
 
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-release
-          path: ${{ env.TARGET_DIR }}/build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
+      - name: Copy APK
+        run: |
+          cp build/app/outputs/flutter-apk/app-release.apk \
+          ../app-release-${GITHUB_REF_NAME}.apk
 
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.TARGET_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          tag_name: ${{ github.ref_name }}
+          name: "Flutter APK ${{ github.ref_name }}"
           generate_release_notes: true
+          files: app-release-${{ github.ref_name }}.apk
