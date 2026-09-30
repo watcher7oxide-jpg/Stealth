@@ -24,15 +24,19 @@ android {
         targetSdk = 34
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // Force 64-bit ARM to prevent 32-bit missing libllama.so crash
+        ndk {
+            abiFilters.addAll(listOf("arm64-v8a"))
+        }
     }
 
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("debug")
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            // Disable minification so R8 cannot strip JNI/Pigeon bindings
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }
