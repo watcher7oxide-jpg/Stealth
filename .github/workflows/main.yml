@@ -34,16 +34,23 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Clean Flutter and Gradle
+        run: |
+          flutter clean
+          rm -rf build
+          rm -rf android/.gradle
+
       - name: Get Dependencies
         run: flutter pub get
 
       - name: Build Release APK
-        run: flutter build apk --release
+        run: flutter build apk --release --no-tree-shake-icons
 
       - name: Verify APK
         run: |
           echo "APK generated:"
           ls -lh build/app/outputs/flutter-apk/app-release.apk
+          test -f build/app/outputs/flutter-apk/app-release.apk
 
       - name: Copy APK
         run: |
