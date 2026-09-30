@@ -10,6 +10,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 void main() async {
@@ -348,17 +349,18 @@ class _ChatScreenState extends State<ChatScreen> {
       final request = OpenAiRequest(
         modelPath: _loadedGgufPath!,
         messages: [
-          OpenAiChatMessage(Role.user, promptBuffer.toString()),
+          OpenAiMessage(
+            role: OpenAiRole.user,
+            text: promptBuffer.toString(),
+          ),
         ],
         contextSize: 1024,
-        threads: 2,
-        numGpuLayers: 0,
         temperature: 0.7,
       );
 
       fllamaChat(
         request,
-        (response, done) {
+        (String response, bool done) {
           responseBuffer.write(response);
           if (done && !completer.isCompleted) {
             completer.complete(responseBuffer.toString().trim());
@@ -449,7 +451,7 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _isListening = false);
     } else {
       setState(() => _isListening = true);
-      await _speech.listen(onResult: (result) {
+      await _speech.listen(onResult: (SpeechRecognitionResult result) {
         setState(() => _textController.text = result.recognizedWords);
       });
     }
@@ -708,7 +710,9 @@ class _ChatScreenState extends State<ChatScreen> {
                           final data = jsonDecode(utf8.decode(res.files.single.bytes!));
                           setState(() => _memoryBank.importFromJson(data));
                           await _saveMemoryToDisk();
-                          Navigator.pop(ctx);
+                          if (ctx.mounted) {
+                            Navigator.pop(ctx);
+                          }
                         }
                       },
                     ),
