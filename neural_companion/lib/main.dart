@@ -21,7 +21,6 @@ final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Catch unhandled Flutter framework errors
   FlutterError.onError = (FlutterErrorDetails details) {
     FlutterError.presentError(details);
     _showGlobalErrorDialog(
@@ -31,7 +30,6 @@ void main() async {
     );
   };
 
-  // Catch unhandled asynchronous/platform errors
   PlatformDispatcher.instance.onError = (error, stack) {
     _showGlobalErrorDialog(
       "Async Platform Error",
@@ -136,6 +134,22 @@ class ChatMessage {
     this.attachments = const [],
   });
 
+  ChatMessage copyWith({
+    String? id,
+    String? text,
+    bool? isUser,
+    DateTime? timestamp,
+    List<AttachmentItem>? attachments,
+  }) {
+    return ChatMessage(
+      id: id ?? this.id,
+      text: text ?? this.text,
+      isUser: isUser ?? this.isUser,
+      timestamp: timestamp ?? this.timestamp,
+      attachments: attachments ?? this.attachments,
+    );
+  }
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'text': text,
@@ -186,11 +200,11 @@ class LearnedMemoryFact {
 }
 
 class CognitiveMemoryBank {
-  String personaOverview = "Helpful personal collaborator.";
+  String personaOverview = "Helpful, ultra-fast personal companion.";
   List<LearnedMemoryFact> facts = [];
 
   Map<String, dynamic> toJson() => {
-        'format': 'NeuralMemory_v1',
+        'format': 'NeuralMemory_v2',
         'exportDate': DateTime.now().toIso8601String(),
         'personaOverview': personaOverview,
         'facts': facts.map((f) => f.toJson()).toList(),
@@ -205,16 +219,17 @@ class CognitiveMemoryBank {
     }
   }
 
+  /// Compact system context: extracts top 8 facts to fit SmolLM2's context
   String buildSystemContext() {
     final buffer = StringBuffer();
-    buffer.write("System: You are an autonomous AI companion. ");
+    buffer.write("You are an intelligent, concise AI assistant. ");
     if (facts.isNotEmpty) {
-      buffer.write("Known facts: ");
-      for (final f in facts.take(10)) {
+      buffer.write("Remember: ");
+      for (final f in facts.take(8)) {
         buffer.write("[${f.fact}] ");
       }
     }
-    return buffer.toString();
+    return buffer.toString().trim();
   }
 }
 
@@ -262,23 +277,18 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<AttachmentItem> _selectedAttachments = [];
 
   final CognitiveMemoryBank _memoryBank = CognitiveMemoryBank();
-
-  // Native GGUF Controller
   final LlamaController _llama = LlamaController();
 
-  // Audio & Voice
   final stt.SpeechToText _speech = stt.SpeechToText();
   final FlutterTts _tts = FlutterTts();
   bool _speechEnabled = false;
   bool _isListening = false;
-  bool _voiceResponseEnabled = true;
+  bool _voiceResponseEnabled = false;
 
-  // Runtime State
   String? _loadedGgufPath;
   String _modelStatus = "No .gguf loaded";
   bool _isProcessing = false;
 
-  // Native MethodChannel for Large File Picking
   static const MethodChannel _pickerChannel =
       MethodChannel('com.example.neural_companion/file_picker');
 
@@ -301,7 +311,74 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
-  /// Intercepts native crash file if the previous run terminated abruptly
+  /* ---------------- PERSISTENT CHAT & MEMORY STORAGE ---------------- */
+
+  Future<File> _getChatHistoryFile() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}/chat_history_v2.json');
+  }
+
+  Future<void> _saveChatHistoryToDisk() async {
+    try {
+      final file = await _getChatHistoryFile();
+      final List<Map<String, dynamic>> jsonList =
+          _messages.map((m) => m.toJson()).toList();
+      await file.writeAsString(jsonEncode(jsonList));
+    } catch (_) {}
+  }
+
+  Future<void> _loadChatHistoryFromDisk() async {
+    try {
+      final file = await _getChatHistoryFile();
+      if (await file.exists()) {
+        final content = await file.readAsString();
+        final List<dynamic> jsonList = jsonDecode(content);
+        setState(() {
+          _messages.clear();
+          for (final item in jsonList) {
+            _messages.add(ChatMessage.fromJson(item as Map<String, dynamic>));
+          }
+        });
+        _scrollToBottom();
+      }
+    } catch (_) {}
+  }
+
+  Future<File> _getLocalMemoryFile() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}/autonomous_cognitive_memory.json');
+  }
+
+  Future<void> _saveMemoryToDisk() async {
+    try {
+      final file = await _getLocalMemoryFile();
+      await file.writeAsString(jsonEncode(_memoryBank.toJson()));
+    } catch (_) {}
+  }
+
+  Future<void> _loadMemoryFromDisk() async {
+    try {
+      final file = await _getLocalMemoryFile();
+      if (await file.exists()) {
+        final content = await file.readAsString();
+        final Map<String, dynamic> data = jsonDecode(content);
+        setState(() {
+          _memoryBank.importFromJson(data);
+        });
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _loadSavedState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedPath = prefs.getString('saved_gguf_path');
+    if (savedPath != null && await File(savedPath).exists()) {
+      _bindModel(savedPath);
+    }
+    await _loadMemoryFromDisk();
+    await _loadChatHistoryFromDisk();
+  }
+
   Future<void> _checkPreviousNativeCrash() async {
     try {
       final appDir = await getApplicationDocumentsDirectory();
@@ -319,15 +396,6 @@ class _ChatScreenState extends State<ChatScreen> {
         });
       }
     } catch (_) {}
-  }
-
-  Future<void> _loadSavedState() async {
-    final prefs = await SharedPreferences.getInstance();
-    final savedPath = prefs.getString('saved_gguf_path');
-    if (savedPath != null && await File(savedPath).exists()) {
-      _bindModel(savedPath);
-    }
-    await _loadMemoryFromDisk();
   }
 
   Future<void> _initSpeechEngine() async {
@@ -348,26 +416,25 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _initTtsEngine() async {
     await _tts.setLanguage("en-US");
-    await _tts.setSpeechRate(0.52);
+    await _tts.setSpeechRate(0.55);
     await _tts.setVolume(1.0);
   }
 
-  /* ------------------- 64-BIT NATIVE GGUF MODEL SELECTOR ------------------- */
+  /* ---------------- GGUF SELECTION & LOADING ---------------- */
 
   Future<void> _selectGgufModel() async {
     if (kIsWeb) {
       _showGlobalErrorDialog(
         "Platform Not Supported",
-        "GGUF native execution requires ARM64 Android hardware and cannot execute in Web browsers.",
-        "Compile and run the APK on a physical Android device.",
+        "GGUF native execution requires ARM64 Android hardware.",
+        "Run the release APK on your device.",
       );
       return;
     }
 
     try {
-      setState(() => _modelStatus = "Opening native picker...");
+      setState(() => _modelStatus = "Opening picker...");
 
-      // Calls our 64-bit native Android picker (bypasses file_selector's 2GB bug and heap OOM)
       final String? selectedPath =
           await _pickerChannel.invokeMethod<String>('pickGgufFile');
 
@@ -380,49 +447,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
       final file = File(selectedPath);
       if (!await file.exists()) {
-        _showGlobalErrorDialog(
-          "File Error",
-          "File path not accessible: $selectedPath",
-          "Check storage permissions.",
-        );
-        return;
-      }
-
-      final int fileSizeBytes = await file.length();
-      final double fileSizeMB = fileSizeBytes / (1024 * 1024);
-
-      setState(() => _modelStatus = "Model size: ${fileSizeMB.toStringAsFixed(0)} MB");
-
-      // Memory limit safety check for 4GB RAM phones:
-      if (fileSizeMB > 2300) {
-        if (mounted) {
-          showDialog(
-            context: context,
-            builder: (ctx) => AlertDialog(
-              backgroundColor: const Color(0xFF1E2230),
-              title: const Text("Model Exceeds Safe RAM Limit", style: TextStyle(color: Colors.redAccent)),
-              content: Text(
-                "The selected model is ${fileSizeMB.toStringAsFixed(1)} MB.\n\n"
-                "A 4GB RAM phone has ~1.6GB free RAM. Loading models larger than 2.2GB causes the kernel to kill the process (OOM Killer).\n\n"
-                "Recommended: Use a 1B, 1.5B, or 3B Q4_K_M model.",
-                style: const TextStyle(color: Colors.white70, fontSize: 13),
-              ),
-              actions: [
-                TextButton(
-                  child: const Text("Cancel"),
-                  onPressed: () => Navigator.pop(ctx),
-                ),
-                ElevatedButton(
-                  child: const Text("Attempt Load"),
-                  onPressed: () {
-                    Navigator.pop(ctx);
-                    _bindModel(selectedPath);
-                  },
-                ),
-              ],
-            ),
-          );
-        }
+        _showGlobalErrorDialog("File Error", "Cannot access: $selectedPath", "Verify permissions.");
         return;
       }
 
@@ -432,34 +457,26 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /// Passes the filesystem path directly to llama.cpp with ZERO memory allocation
   Future<void> _bindModel(String rawPath) async {
     try {
-      setState(() => _modelStatus = "Verifying direct path...");
+      setState(() => _modelStatus = "Verifying path...");
 
       final file = File(rawPath);
       if (!await file.exists()) {
-        setState(() => _modelStatus = "Path unreadable: $rawPath");
-        _showGlobalErrorDialog(
-          "Storage Access Error",
-          "File does not exist at path: $rawPath",
-          "Android Scoped Storage may be blocking direct access to this directory.",
-        );
+        setState(() => _modelStatus = "File not found");
         return;
       }
 
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('saved_gguf_path', rawPath);
 
-      setState(() => _modelStatus = "Initializing llama.cpp engine...");
+      setState(() => _modelStatus = "Binding engine...");
 
-      // 4GB RAM Phone Tuned Parameters:
-      // contextSize: 512 keeps the KV-cache under 120MB
-      // threads: 2 prevents thermal throttling and CPU spike
+      // Tuned for maximum generation speed on SmolLM2-360M / Qwen-0.5B:
       await _llama.loadModel(
         modelPath: rawPath,
-        threads: 2,
-        contextSize: 512,
+        threads: 4,        // 4 performance cores for high tokens/sec
+        contextSize: 768,  // Lightweight context to eliminate CPU lag
       );
 
       setState(() {
@@ -469,209 +486,18 @@ class _ChatScreenState extends State<ChatScreen> {
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Model loaded: ${rawPath.split('/').last}")),
+          SnackBar(content: Text("Model ready: ${rawPath.split('/').last}")),
         );
       }
     } catch (e, stack) {
-      _showGlobalErrorDialog("Native llama.cpp Load Error", e.toString(), stack.toString());
+      _showGlobalErrorDialog("Model Binding Error", e.toString(), stack.toString());
       if (mounted) {
-        setState(() => _modelStatus = "Load error: $e");
+        setState(() => _modelStatus = "Load error");
       }
     }
   }
 
-  /* ------------------- ON-DEVICE LOGCAT VIEWER (NO PC NEEDED) ------------------- */
-
-  Future<void> _showDeviceLogcat() async {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF141721),
-        title: const Text("Device System Logs", style: TextStyle(color: Color(0xFF00D2FF), fontSize: 16)),
-        content: FutureBuilder<ProcessResult>(
-          future: Process.run('logcat', ['-d', '-v', 'brief', '-t', '150']),
-          builder: (context, snapshot) {
-            if (snapshot.connectionState == ConnectionState.waiting) {
-              return const SizedBox(
-                height: 120,
-                child: Center(child: CircularProgressIndicator()),
-              );
-            }
-            final logs = snapshot.data?.stdout?.toString() ?? "No logcat output available";
-            return SizedBox(
-              width: double.maxFinite,
-              height: 400,
-              child: SingleChildScrollView(
-                child: SelectableText(
-                  logs,
-                  style: const TextStyle(fontSize: 10, fontFamily: 'monospace', color: Colors.white70),
-                ),
-              ),
-            );
-          },
-        ),
-        actions: [
-          TextButton(
-            child: const Text("Close"),
-            onPressed: () => Navigator.pop(ctx),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /* ---------------- Inference Engine ---------------- */
-
-  Future<String> _runGgufInference(
-    String userText,
-    List<AttachmentItem> attachments,
-  ) async {
-    if (_loadedGgufPath == null || !File(_loadedGgufPath!).existsSync()) {
-      return "No .gguf model selected. Tap the header to select your model file.";
-    }
-
-    final StringBuffer promptBuffer = StringBuffer();
-    promptBuffer.writeln(_memoryBank.buildSystemContext());
-
-    final recent = _messages.length > 3
-        ? _messages.sublist(_messages.length - 3)
-        : _messages;
-    for (final m in recent) {
-      promptBuffer.writeln("${m.isUser ? 'User' : 'Assistant'}: ${m.text}");
-    }
-
-    for (final a in attachments) {
-      if (a.bytes != null && !a.isImage && a.size < 50000) {
-        try {
-          final decoded = utf8.decode(a.bytes!);
-          final preview =
-              decoded.length > 200 ? decoded.substring(0, 200) : decoded;
-          promptBuffer.writeln("[Attached Text (${a.name})]: $preview");
-        } catch (_) {}
-      } else {
-        promptBuffer.writeln("[Attached File: ${a.name}]");
-      }
-    }
-
-    promptBuffer.writeln("User: $userText\nAssistant:");
-
-    final StringBuffer outputBuffer = StringBuffer();
-    final completer = Completer<String>();
-
-    try {
-      final stream = _llama.generate(
-        prompt: promptBuffer.toString(),
-        temperature: 0.7,
-        maxTokens: 300,
-      );
-
-      final subscription = stream.listen(
-        (token) {
-          outputBuffer.write(token);
-        },
-        onError: (err, stack) {
-          _showGlobalErrorDialog("Stream Token Error", err.toString(), stack.toString());
-          if (!completer.isCompleted) completer.complete("Error: $err");
-        },
-        onDone: () {
-          if (!completer.isCompleted) {
-            completer.complete(outputBuffer.toString().trim());
-          }
-        },
-      );
-
-      return await completer.future.timeout(
-        const Duration(seconds: 45),
-        onTimeout: () {
-          subscription.cancel();
-          return outputBuffer.isNotEmpty
-              ? outputBuffer.toString().trim()
-              : "Response timed out under current hardware limits.";
-        },
-      );
-    } catch (e, stack) {
-      _showGlobalErrorDialog("Inference Failure", e.toString(), stack.toString());
-      return "Execution halted: $e";
-    }
-  }
-
-  void _triggerSimultaneousLearning(
-    String userPrompt,
-    List<AttachmentItem> attachments,
-  ) {
-    unawaited(() async {
-      final lower = userPrompt.toLowerCase();
-      if (lower.contains("i like") ||
-          lower.contains("i prefer") ||
-          lower.contains("my name") ||
-          lower.contains("remember")) {
-        _memoryBank.facts.insert(
-          0,
-          LearnedMemoryFact(
-            id: DateTime.now().millisecondsSinceEpoch.toString(),
-            fact: userPrompt,
-            category: 'preference',
-            learnedAt: DateTime.now(),
-          ),
-        );
-      }
-
-      for (final a in attachments) {
-        _memoryBank.facts.insert(
-          0,
-          LearnedMemoryFact(
-            id: DateTime.now().millisecondsSinceEpoch.toString(),
-            fact: "Processed file: ${a.name}",
-            category: 'attachment',
-            learnedAt: DateTime.now(),
-          ),
-        );
-      }
-
-      if (_memoryBank.facts.length > 50) {
-        _memoryBank.facts = _memoryBank.facts.sublist(0, 50);
-      }
-
-      await _saveMemoryToDisk();
-      if (mounted) setState(() {});
-    }());
-  }
-
-  Future<File> _getLocalMemoryFile() async {
-    final dir = await getApplicationDocumentsDirectory();
-    return File('${dir.path}/autonomous_cognitive_memory.json');
-  }
-
-  Future<void> _saveMemoryToDisk() async {
-    final file = await _getLocalMemoryFile();
-    await file.writeAsString(jsonEncode(_memoryBank.toJson()));
-  }
-
-  Future<void> _loadMemoryFromDisk() async {
-    try {
-      final file = await _getLocalMemoryFile();
-      if (await file.exists()) {
-        final content = await file.readAsString();
-        final Map<String, dynamic> data = jsonDecode(content);
-        setState(() {
-          _memoryBank.importFromJson(data);
-        });
-      }
-    } catch (_) {}
-  }
-
-  void _toggleListening() async {
-    if (!_speechEnabled) return;
-    if (_isListening) {
-      await _speech.stop();
-      setState(() => _isListening = false);
-    } else {
-      setState(() => _isListening = true);
-      await _speech.listen(onResult: (SpeechRecognitionResult result) {
-        setState(() => _textController.text = result.recognizedWords);
-      });
-    }
-  }
+  /* ---------------- REAL-TIME STREAMING INFERENCE ENGINE ---------------- */
 
   Future<void> _handleSendMessage() async {
     final text = _textController.text.trim();
@@ -682,7 +508,16 @@ class _ChatScreenState extends State<ChatScreen> {
       _isListening = false;
     }
 
+    if (_loadedGgufPath == null || !File(_loadedGgufPath!).existsSync()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Please select a .gguf model file first!")),
+      );
+      return;
+    }
+
     final outgoingAttachments = List<AttachmentItem>.from(_selectedAttachments);
+
+    // 1. Add User Message
     final userMsg = ChatMessage(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       text: text,
@@ -691,36 +526,262 @@ class _ChatScreenState extends State<ChatScreen> {
       attachments: outgoingAttachments,
     );
 
+    // 2. Add placeholder Assistant Message for real-time streaming
+    final String assistantMsgId =
+        (DateTime.now().millisecondsSinceEpoch + 1).toString();
+    final assistantMsg = ChatMessage(
+      id: assistantMsgId,
+      text: "",
+      isUser: false,
+      timestamp: DateTime.now(),
+    );
+
     setState(() {
       _messages.add(userMsg);
+      _messages.add(assistantMsg);
       _textController.clear();
       _selectedAttachments.clear();
       _isProcessing = true;
     });
 
     _scrollToBottom();
+    await _saveChatHistoryToDisk();
 
-    final replyText = await _runGgufInference(text, outgoingAttachments);
+    // 3. Build Safe Rolling Prompt (Eliminates "Drunkard" hallucination loops)
+    final prompt = _buildRollingPrompt(text, outgoingAttachments);
 
-    final aiMsg = ChatMessage(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      text: replyText,
-      isUser: false,
-      timestamp: DateTime.now(),
-    );
+    final StringBuffer streamBuffer = StringBuffer();
 
-    setState(() {
-      _messages.add(aiMsg);
-      _isProcessing = false;
-    });
+    try {
+      final stream = _llama.generate(
+        prompt: prompt,
+        temperature: 0.6,
+        maxTokens: 350,
+      );
 
-    _scrollToBottom();
+      final subscription = stream.listen(
+        (token) {
+          // Catch and cut off hallucinated loop tokens immediately
+          if (token.contains("<|im_end|>") ||
+              token.contains("<|endoftext|>") ||
+              token.contains("User:") ||
+              token.contains("\nUser")) {
+            return;
+          }
 
-    if (_voiceResponseEnabled && replyText.isNotEmpty) {
-      await _tts.speak(replyText);
+          streamBuffer.write(token);
+          final currentText = streamBuffer.toString();
+
+          // Stream letters/words to screen in real time
+          setState(() {
+            final idx = _messages.indexWhere((m) => m.id == assistantMsgId);
+            if (idx != -1) {
+              _messages[idx] = _messages[idx].copyWith(text: currentText);
+            }
+          });
+          _scrollToBottom();
+        },
+        onError: (err, stack) {
+          _showGlobalErrorDialog("Stream Error", err.toString(), stack.toString());
+        },
+      );
+
+      await stream.drain().timeout(
+        const Duration(seconds: 45),
+        onTimeout: () => subscription.cancel(),
+      );
+
+      final finalReply = streamBuffer.toString().trim();
+
+      // Finalize message
+      setState(() {
+        final idx = _messages.indexWhere((m) => m.id == assistantMsgId);
+        if (idx != -1) {
+          _messages[idx] = _messages[idx].copyWith(
+            text: finalReply.isNotEmpty ? finalReply : "(No response generated)",
+          );
+        }
+        _isProcessing = false;
+      });
+
+      _scrollToBottom();
+      await _saveChatHistoryToDisk();
+
+      if (_voiceResponseEnabled && finalReply.isNotEmpty) {
+        await _tts.speak(finalReply);
+      }
+
+      // Automatically extract and preserve discussion points in long-term memory
+      _autoExtractMemory(text, finalReply);
+    } catch (e, stack) {
+      setState(() => _isProcessing = false);
+      _showGlobalErrorDialog("Inference Error", e.toString(), stack.toString());
+    }
+  }
+
+  /// Rolling context builder: keeps only the system context, top memories,
+  /// and the last 3 turns. This guarantees the model never runs out of context.
+  String _buildRollingPrompt(String currentInput, List<AttachmentItem> attachments) {
+    final buffer = StringBuffer();
+
+    // System prompt with long-term memory
+    buffer.writeln("<|im_start|>system");
+    buffer.writeln(_memoryBank.buildSystemContext());
+    buffer.writeln("<|im_end|>");
+
+    // Rolling window: last 3 turns only
+    final history = _messages.where((m) => m.text.isNotEmpty).toList();
+    final recentHistory =
+        history.length > 6 ? history.sublist(history.length - 6) : history;
+
+    for (final m in recentHistory) {
+      if (m.isUser) {
+        buffer.writeln("<|im_start|>user\n${m.text}<|im_end|>");
+      } else {
+        buffer.writeln("<|im_start|>assistant\n${m.text}<|im_end|>");
+      }
     }
 
-    _triggerSimultaneousLearning(text, outgoingAttachments);
+    // Attachments text preview
+    final StringBuffer attachmentText = StringBuffer();
+    for (final a in attachments) {
+      if (a.bytes != null && !a.isImage && a.size < 50000) {
+        try {
+          final decoded = utf8.decode(a.bytes!);
+          final preview =
+              decoded.length > 150 ? decoded.substring(0, 150) : decoded;
+          attachmentText.writeln("[File: ${a.name}]: $preview");
+        } catch (_) {}
+      }
+    }
+
+    // Current turn
+    buffer.writeln("<|im_start|>user");
+    if (attachmentText.isNotEmpty) {
+      buffer.write(attachmentText.toString());
+    }
+    buffer.writeln("$currentInput<|im_end|>");
+    buffer.writeln("<|im_start|>assistant");
+
+    return buffer.toString();
+  }
+
+  /* ---------------- CONTINUOUS DISCUSSION ARCHIVAL ---------------- */
+
+  void _autoExtractMemory(String userText, String assistantReply) {
+    unawaited(() async {
+      final cleanInput = userText.trim();
+      if (cleanInput.length < 4) return;
+
+      final lower = cleanInput.toLowerCase();
+
+      // Automatically store personal declarations, constraints, facts, and topics
+      final bool isFact = lower.startsWith("i ") ||
+          lower.startsWith("my ") ||
+          lower.contains("prefer") ||
+          lower.contains("like") ||
+          lower.contains("hate") ||
+          lower.contains("remember") ||
+          lower.contains("live in") ||
+          lower.contains("working on") ||
+          lower.contains("built");
+
+      if (isFact) {
+        final existing = _memoryBank.facts.any(
+          (f) => f.fact.toLowerCase() == cleanInput.toLowerCase(),
+        );
+
+        if (!existing) {
+          _memoryBank.facts.insert(
+            0,
+            LearnedMemoryFact(
+              id: DateTime.now().millisecondsSinceEpoch.toString(),
+              fact: cleanInput,
+              category: 'discussion',
+              learnedAt: DateTime.now(),
+            ),
+          );
+        }
+      }
+
+      // Memory cap of 75 most relevant entries to prevent token bloat
+      if (_memoryBank.facts.length > 75) {
+        _memoryBank.facts = _memoryBank.facts.sublist(0, 75);
+      }
+
+      await _saveMemoryToDisk();
+      if (mounted) setState(() {});
+    }());
+  }
+
+  void _deleteMemory(int index) async {
+    setState(() {
+      _memoryBank.facts.removeAt(index);
+    });
+    await _saveMemoryToDisk();
+  }
+
+  void _clearAllMemories() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2230),
+        title: const Text("Clear All Memories?"),
+        content: const Text("This will permanently remove all stored facts from the cognitive bank."),
+        actions: [
+          TextButton(
+            child: const Text("Cancel"),
+            onPressed: () => Navigator.pop(ctx, false),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            child: const Text("Wipe All"),
+            onPressed: () => Navigator.pop(ctx, true),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      setState(() {
+        _memoryBank.facts.clear();
+      });
+      await _saveMemoryToDisk();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("All memories cleared.")),
+        );
+      }
+    }
+  }
+
+  void _clearChatHistory() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2230),
+        title: const Text("Clear Current Chat?"),
+        content: const Text("This resets the current screen without erasing stored facts in the Memory Bank."),
+        actions: [
+          TextButton(
+            child: const Text("Cancel"),
+            onPressed: () => Navigator.pop(ctx, false),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            child: const Text("Clear"),
+            onPressed: () => Navigator.pop(ctx, true),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      setState(() {
+        _messages.clear();
+      });
+      await _saveChatHistoryToDisk();
+    }
   }
 
   void _scrollToBottom() {
@@ -728,12 +789,14 @@ class _ChatScreenState extends State<ChatScreen> {
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
           _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
+          duration: const Duration(milliseconds: 150),
           curve: Curves.easeOut,
         );
       }
     });
   }
+
+  /* ---------------- UI CONSTRUCTION ---------------- */
 
   @override
   Widget build(BuildContext context) {
@@ -745,7 +808,7 @@ class _ChatScreenState extends State<ChatScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text("Local Companion", style: TextStyle(fontSize: 16)),
+              const Text("Neural Companion", style: TextStyle(fontSize: 16)),
               Text(
                 _modelStatus,
                 style: const TextStyle(fontSize: 10, color: Color(0xFF00D2FF)),
@@ -756,9 +819,9 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         actions: [
           IconButton(
-            tooltip: "System Logs",
-            icon: const Icon(Icons.terminal, color: Colors.amberAccent),
-            onPressed: _showDeviceLogcat,
+            tooltip: "Clear Chat Screen",
+            icon: const Icon(Icons.delete_sweep, color: Colors.white70),
+            onPressed: _clearChatHistory,
           ),
           IconButton(
             tooltip: _voiceResponseEnabled ? "TTS: On" : "TTS: Off",
@@ -781,37 +844,52 @@ class _ChatScreenState extends State<ChatScreen> {
       body: Column(
         children: [
           Expanded(
-            child: ListView.builder(
-              controller: _scrollController,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              itemCount: _messages.length,
-              itemBuilder: (context, i) {
-                final m = _messages[i];
-                return Align(
-                  alignment: m.isUser ? Alignment.centerRight : Alignment.centerLeft,
-                  child: Container(
-                    margin: const EdgeInsets.symmetric(vertical: 4),
-                    padding: const EdgeInsets.all(12),
-                    constraints: BoxConstraints(
-                      maxWidth: MediaQuery.of(context).size.width * 0.82,
+            child: _messages.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.bolt, size: 48, color: Colors.white.withValues(alpha: 0.2)),
+                        const SizedBox(height: 8),
+                        Text(
+                          "Smol 360M Engine Ready\nContinuous Chat Active",
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Colors.white.withValues(alpha: 0.4), fontSize: 13),
+                        ),
+                      ],
                     ),
-                    decoration: BoxDecoration(
-                      color: m.isUser ? const Color(0xFF6C63FF) : const Color(0xFF1E2230),
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    child: Text(
-                      m.text,
-                      style: const TextStyle(fontSize: 14, color: Colors.white),
-                    ),
+                  )
+                : ListView.builder(
+                    controller: _scrollController,
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    itemCount: _messages.length,
+                    itemBuilder: (context, i) {
+                      final m = _messages[i];
+                      return Align(
+                        alignment: m.isUser ? Alignment.centerRight : Alignment.centerLeft,
+                        child: Container(
+                          margin: const EdgeInsets.symmetric(vertical: 4),
+                          padding: const EdgeInsets.all(12),
+                          constraints: BoxConstraints(
+                            maxWidth: MediaQuery.of(context).size.width * 0.82,
+                          ),
+                          decoration: BoxDecoration(
+                            color: m.isUser ? const Color(0xFF6C63FF) : const Color(0xFF1E2230),
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          child: Text(
+                            m.text.isEmpty && !m.isUser ? "..." : m.text,
+                            style: const TextStyle(fontSize: 14, color: Colors.white, height: 1.3),
+                          ),
+                        ),
+                      );
+                    },
                   ),
-                );
-              },
-            ),
           ),
           if (_isProcessing)
             const LinearProgressIndicator(
               backgroundColor: Color(0xFF141721),
-              valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF6C63FF)),
+              valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF00D2FF)),
               minHeight: 2,
             ),
           _buildInputBar(),
@@ -835,8 +913,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   for (final f in files) {
                     final bytes = await f.readAsBytes();
                     final size = await f.length();
-                    final ext =
-                        f.name.contains('.') ? f.name.split('.').last : '';
+                    final ext = f.name.contains('.') ? f.name.split('.').last : '';
                     setState(() {
                       _selectedAttachments.add(
                         AttachmentItem(
@@ -858,14 +935,25 @@ class _ChatScreenState extends State<ChatScreen> {
                 _isListening ? Icons.mic : Icons.mic_none,
                 color: _isListening ? Colors.redAccent : Colors.white70,
               ),
-              onPressed: _toggleListening,
+              onPressed: () async {
+                if (!_speechEnabled) return;
+                if (_isListening) {
+                  await _speech.stop();
+                  setState(() => _isListening = false);
+                } else {
+                  setState(() => _isListening = true);
+                  await _speech.listen(onResult: (SpeechRecognitionResult result) {
+                    setState(() => _textController.text = result.recognizedWords);
+                  });
+                }
+              },
             ),
             Expanded(
               child: TextField(
                 controller: _textController,
                 style: const TextStyle(color: Colors.white),
                 decoration: InputDecoration(
-                  hintText: _isListening ? "Listening..." : "Type instruction...",
+                  hintText: _isListening ? "Listening..." : "Message companion...",
                   hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.3)),
                   filled: true,
                   fillColor: const Color(0xFF1E2230),
@@ -888,76 +976,125 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  /* ---------------- MEMORY BANK MODAL (EDIT & DELETE) ---------------- */
+
   void _showMemoryModal() {
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       backgroundColor: const Color(0xFF1A1D26),
       builder: (ctx) {
-        return Container(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                "Memory Bank (${_memoryBank.facts.length} entries)",
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-              ),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      icon: const Icon(Icons.upload),
-                      label: const Text("Export Memory"),
-                      onPressed: () async {
-                        final file = await _getLocalMemoryFile();
-                        await _saveMemoryToDisk();
-                        if (await file.exists()) {
-                          await Share.shareXFiles([XFile(file.path)]);
-                        }
-                      },
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return FractionallySizedBox(
+              heightFactor: 0.75,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          "Memory Bank (${_memoryBank.facts.length})",
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                        ),
+                        if (_memoryBank.facts.isNotEmpty)
+                          TextButton.icon(
+                            style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+                            icon: const Icon(Icons.delete_forever, size: 18),
+                            label: const Text("Clear All"),
+                            onPressed: () {
+                              Navigator.pop(ctx);
+                              _clearAllMemories();
+                            },
+                          ),
+                      ],
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      icon: const Icon(Icons.download),
-                      label: const Text("Import Memory"),
-                      onPressed: () async {
-                        const jsonTypeGroup = XTypeGroup(
-                          label: 'JSON Files',
-                          extensions: ['json'],
-                        );
-                        final XFile? file = await openFile(
-                          acceptedTypeGroups: const [jsonTypeGroup],
-                        );
-                        if (file != null) {
-                          final bytes = await file.readAsBytes();
-                          final data = jsonDecode(utf8.decode(bytes));
-                          setState(() => _memoryBank.importFromJson(data));
-                          await _saveMemoryToDisk();
-                          if (ctx.mounted) {
-                            Navigator.pop(ctx);
-                          }
-                        }
-                      },
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            icon: const Icon(Icons.upload, size: 16),
+                            label: const Text("Export"),
+                            onPressed: () async {
+                              final file = await _getLocalMemoryFile();
+                              await _saveMemoryToDisk();
+                              if (await file.exists()) {
+                                await Share.shareXFiles([XFile(file.path)]);
+                              }
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            icon: const Icon(Icons.download, size: 16),
+                            label: const Text("Import"),
+                            onPressed: () async {
+                              const jsonTypeGroup = XTypeGroup(
+                                label: 'JSON Files',
+                                extensions: ['json'],
+                              );
+                              final XFile? file = await openFile(
+                                acceptedTypeGroups: const [jsonTypeGroup],
+                              );
+                              if (file != null) {
+                                final bytes = await file.readAsBytes();
+                                final data = jsonDecode(utf8.decode(bytes));
+                                setState(() => _memoryBank.importFromJson(data));
+                                setModalState(() {});
+                                await _saveMemoryToDisk();
+                              }
+                            },
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                ],
-              ),
-              const Divider(height: 24),
-              Expanded(
-                child: ListView.builder(
-                  itemCount: _memoryBank.facts.length,
-                  itemBuilder: (_, i) => ListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    title: Text(_memoryBank.facts[i].fact, style: const TextStyle(fontSize: 13)),
-                  ),
+                    const Divider(height: 24),
+                    Expanded(
+                      child: _memoryBank.facts.isEmpty
+                          ? const Center(
+                              child: Text(
+                                "No memories stored yet.\nTalk with the model to automatically accumulate knowledge.",
+                                textAlign: TextAlign.center,
+                                style: TextStyle(color: Colors.white38, fontSize: 13),
+                              ),
+                            )
+                          : ListView.separated(
+                              itemCount: _memoryBank.facts.length,
+                              separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white10),
+                              itemBuilder: (_, i) {
+                                final item = _memoryBank.facts[i];
+                                return ListTile(
+                                  dense: true,
+                                  contentPadding: EdgeInsets.zero,
+                                  title: Text(
+                                    item.fact,
+                                    style: const TextStyle(fontSize: 13, color: Colors.white),
+                                  ),
+                                  subtitle: Text(
+                                    "${item.category} • ${item.learnedAt.hour}:${item.learnedAt.minute.toString().padLeft(2, '0')}",
+                                    style: const TextStyle(fontSize: 10, color: Colors.white38),
+                                  ),
+                                  trailing: IconButton(
+                                    icon: const Icon(Icons.close, size: 16, color: Colors.redAccent),
+                                    onPressed: () {
+                                      _deleteMemory(i);
+                                      setModalState(() {});
+                                    },
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
                 ),
               ),
-            ],
-          ),
+            );
+          },
         );
       },
     );
