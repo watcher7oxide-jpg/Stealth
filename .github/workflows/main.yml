@@ -34,10 +34,24 @@ jobs:
           flutter-version: "3.27.4"
           cache: true
 
-      # Forces Gradle wrapper to 8.10.2 so Gradle 9's groovy.xml.QName crash cannot happen
-      - name: Enforce Gradle 8.10.2
+      # Synchronizes AGP and Gradle wrapper to the stable 8.x pair
+      - name: Align AGP 8.7.0 and Gradle 8.10.2
         run: |
-          sed -i 's|gradle-9\.[0-9.]*|gradle-8.10.2|g' android/gradle/wrapper/gradle-wrapper.properties
+          # 1. Downgrade AGP to 8.7.0 in settings.gradle.kts
+          if [ -f "android/settings.gradle.kts" ]; then
+            sed -i -E 's/id\("com\.android\.application"\) version "[^"]+"/id("com.android.application") version "8.7.0"/' android/settings.gradle.kts
+          fi
+
+          # 2. Downgrade Gradle Wrapper to 8.10.2
+          if [ -f "android/gradle/wrapper/gradle-wrapper.properties" ]; then
+            sed -i -E 's/gradle-[0-9.]+-/gradle-8.10.2-/g' android/gradle/wrapper/gradle-wrapper.properties
+          fi
+
+          # 3. Strip any AGP 9 experimental flags from gradle.properties
+          if [ -f "android/gradle.properties" ]; then
+            sed -i '/android.builtInKotlin/d' android/gradle.properties
+            sed -i '/android.newDsl/d' android/gradle.properties
+          fi
 
       - name: Get Dependencies
         run: flutter pub get
