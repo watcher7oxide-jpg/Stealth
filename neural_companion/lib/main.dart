@@ -4,9 +4,9 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
-import 'package:fllama/fllama.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:llama_flutter_android/llama_flutter_android.dart' hide ChatMessage;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -204,6 +204,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final CognitiveMemoryBank _memoryBank = CognitiveMemoryBank();
 
+  // Native GGUF Controller
+  final LlamaController _llama = LlamaController();
+
   // Voice & Audio
   final stt.SpeechToText _speech = stt.SpeechToText();
   final FlutterTts _tts = FlutterTts();
@@ -230,6 +233,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollController.dispose();
     _speech.stop();
     _tts.stop();
+    _llama.dispose();
     super.dispose();
   }
 
@@ -237,12 +241,26 @@ class _ChatScreenState extends State<ChatScreen> {
     final prefs = await SharedPreferences.getInstance();
     final savedPath = prefs.getString('saved_gguf_path');
     if (savedPath != null && await File(savedPath).exists()) {
-      setState(() {
-        _loadedGgufPath = savedPath;
-        _modelStatus = "Ready: ${savedPath.split('/').last}";
-      });
+      _bindModel(savedPath);
     }
     await _loadMemoryFromDisk();
+  }
+
+  Future<void> _bindModel(String path) async {
+    try {
+      setState(() => _modelStatus = "Loading model...");
+      await _llama.loadModel(
+        modelPath: path,
+        threads: 2,
+        contextSize: 1024,
+      );
+      setState(() {
+        _loadedGgufPath = path;
+        _modelStatus = "Ready: ${path.split('/').last}";
+      });
+    } catch (e) {
+      setState(() => _modelStatus = "Load failed: $e");
+    }
   }
 
   Future<void> _initSpeechEngine() async {
@@ -287,10 +305,7 @@ class _ChatScreenState extends State<ChatScreen> {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString('saved_gguf_path', path);
 
-        setState(() {
-          _loadedGgufPath = path;
-          _modelStatus = "Loaded: ${path.split('/').last}";
-        });
+        await _bindModel(path);
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -317,9 +332,8 @@ class _ChatScreenState extends State<ChatScreen> {
       return "No .gguf model selected. Tap the header to select your model file.";
     }
 
-    final systemPrompt = _memoryBank.buildSystemContext();
     final StringBuffer promptBuffer = StringBuffer();
-    promptBuffer.writeln(systemPrompt);
+    promptBuffer.writeln(_memoryBank.buildSystemContext());
 
     final recent = _messages.length > 3
         ? _messages.sublist(_messages.length - 3)
@@ -332,7 +346,8 @@ class _ChatScreenState extends State<ChatScreen> {
       if (a.bytes != null && !a.isImage && a.size < 50000) {
         try {
           final decoded = utf8.decode(a.bytes!);
-          final preview = decoded.length > 200 ? decoded.substring(0, 200) : decoded;
+          final preview =
+              decoded.length > 200 ? decoded.substring(0, 200) : decoded;
           promptBuffer.writeln("[Attached Text (${a.name})]: $preview");
         } catch (_) {}
       } else {
@@ -342,40 +357,41 @@ class _ChatScreenState extends State<ChatScreen> {
 
     promptBuffer.writeln("User: $userText\nAssistant:");
 
+    final StringBuffer outputBuffer = StringBuffer();
     final completer = Completer<String>();
-    final StringBuffer responseBuffer = StringBuffer();
 
     try {
-      final request = OpenAiRequest(
-        modelPath: _loadedGgufPath!,
-        messages: [
-          OpenAiMessage(
-            role: OpenAiRole.user,
-            text: promptBuffer.toString(),
-          ),
-        ],
-        contextSize: 1024,
+      final stream = _llama.generate(
+        prompt: promptBuffer.toString(),
         temperature: 0.7,
+        maxTokens: 300,
       );
 
-      fllamaChat(
-        request,
-        (String response, bool done) {
-          responseBuffer.write(response);
-          if (done && !completer.isCompleted) {
-            completer.complete(responseBuffer.toString().trim());
+      final subscription = stream.listen(
+        (token) {
+          outputBuffer.write(token);
+        },
+        onError: (err) {
+          if (!completer.isCompleted) completer.complete("Inference error: $err");
+        },
+        onDone: () {
+          if (!completer.isCompleted) {
+            completer.complete(outputBuffer.toString().trim());
           }
         },
       );
 
       return await completer.future.timeout(
         const Duration(seconds: 45),
-        onTimeout: () => responseBuffer.isNotEmpty
-            ? responseBuffer.toString()
-            : "Response timed out under current hardware limits.",
+        onTimeout: () {
+          subscription.cancel();
+          return outputBuffer.isNotEmpty
+              ? outputBuffer.toString().trim()
+              : "Response timed out under current hardware limits.";
+        },
       );
     } catch (e) {
-      return "Execution halted: $e. Ensure other background apps are closed to free RAM.";
+      return "Execution halted: $e";
     }
   }
 
