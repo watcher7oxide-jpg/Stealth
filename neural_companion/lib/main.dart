@@ -306,9 +306,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
         // Stream copy to avoid 4GB RAM OOM during large GGUF transfers
         if (!await localFile.exists() || await localFile.length() != await file.length()) {
-          final stream = file.openRead();
-          final sink = localFile.openWrite();
-          await stream.pipe(sink);
+          await file.saveTo(localFile.path);
         }
         finalPath = localFile.path;
       }
@@ -326,6 +324,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     }
   }
+
 
   Future<void> _bindModel(String path) async {
     try {
