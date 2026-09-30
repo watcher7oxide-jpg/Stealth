@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.example.autonomous_companion"
-    compileSdk = 34
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
