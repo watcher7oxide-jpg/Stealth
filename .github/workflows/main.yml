@@ -34,29 +34,58 @@ jobs:
           channel: stable
           cache: true
 
+      # Completely remove previous generated Flutter/Gradle files
       - name: Clean Flutter and Gradle
         run: |
           flutter clean
           rm -rf build
+          rm -rf .dart_tool
           rm -rf android/.gradle
+          rm -rf ~/.gradle/caches
+          rm -rf ~/.gradle/wrapper/dists
 
-      - name: Get Dependencies
-        run: flutter pub get
+      # Regenerate dependency resolution from pubspec.yaml
+      - name: Regenerate Dependencies
+        run: |
+          rm -f pubspec.lock
+          flutter pub get
 
+      # Show the actual versions being used
+      - name: Verify Dependency Versions
+        run: |
+          echo "===== FILE PICKER ====="
+          flutter pub deps | grep -E "file_picker|file_picker_android" || true
+
+          echo ""
+          echo "===== ANDROID GRADLE ====="
+          grep -R "com.android.application" android/settings.gradle.kts || true
+
+          echo ""
+          echo "===== KOTLIN ====="
+          grep -R "org.jetbrains.kotlin.android" android/settings.gradle.kts || true
+
+          echo ""
+          echo "===== GRADLE WRAPPER ====="
+          grep "distributionUrl" android/gradle/wrapper/gradle-wrapper.properties || true
+
+      # Build completely fresh
       - name: Build Release APK
-        run: flutter build apk --release --no-tree-shake-icons
+        run: flutter build apk --release
 
+      # Make absolutely sure the APK exists
       - name: Verify APK
         run: |
-          echo "APK generated:"
+          echo "===== APK ====="
           ls -lh build/app/outputs/flutter-apk/app-release.apk
           test -f build/app/outputs/flutter-apk/app-release.apk
 
+      # Copy APK outside the working directory
       - name: Copy APK
         run: |
           cp build/app/outputs/flutter-apk/app-release.apk \
           ../app-release-${GITHUB_REF_NAME}.apk
 
+      # Publish APK directly to GitHub Release
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
