@@ -20,7 +20,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.neural_companion"
-        minSdk = flutter.minSdkVersion
+        minSdk = 24
         targetSdk = 34
         versionCode = flutter.versionCode
         versionName = flutter.versionName
