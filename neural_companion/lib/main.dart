@@ -386,7 +386,7 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _modelStatus = "File size: ${fileSizeMB.toStringAsFixed(0)} MB");
 
       // Guard against kernel OOM kill on 4GB RAM devices:
-      if (fileSizeMB > 2300) {
+      if (fileSizeMB > 2400) {
         if (mounted) {
           showDialog(
             context: context,
