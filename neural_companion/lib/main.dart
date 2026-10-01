@@ -335,16 +335,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final FlutterTts _tts = FlutterTts();
   bool _speechEnabled = false;
   bool _isListening = false;
-  bool _voiceResponseEnabled = true; // Default ON
+  bool _voiceResponseEnabled = true;
   bool _autoMicSend = true;
 
-  // Unbroken Call Mode
+  // Continuous Call Mode
   bool _callModeActive = false;
   bool _isCallModeAsleep = false;
-  String _wakeWord = "wake up";
-  String _stopWord = "stop";
+  bool _amoledBlackoutEnabled = false;
+  String _wakeWord = "wake up, hey, listen";
+  String _stopWord = "stop, wait, enough, cancel";
 
-  Timer? _silenceCheckTimer;
+  Timer? _silenceTimer;
   Timer? _speechPauseTimer;
 
   // Active audio player tracker
@@ -394,8 +395,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _setNativeForegroundCallService(false);
-    _silenceCheckTimer?.cancel();
+    _setCallModeHardware(false);
+    _silenceTimer?.cancel();
     _speechPauseTimer?.cancel();
     _activeInferenceSubscription?.cancel();
     _textController.dispose();
@@ -406,9 +407,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  Future<void> _setNativeForegroundCallService(bool enable) async {
+  Future<void> _setCallModeHardware(bool enable) async {
     try {
-      await _nativeChannel.invokeMethod('setCallService', {'enable': enable});
+      await _nativeChannel.invokeMethod('setCallModeHardware', {'enable': enable});
     } catch (_) {}
   }
 
@@ -488,8 +489,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (savedPath != null && await File(savedPath).exists()) {
       _bindModel(savedPath);
     }
-    _wakeWord = prefs.getString('saved_wake_word') ?? "wake up";
-    _stopWord = prefs.getString('saved_stop_word') ?? "stop";
+    _wakeWord = prefs.getString('saved_wake_word') ?? "wake up, hey, listen";
+    _stopWord = prefs.getString('saved_stop_word') ?? "stop, wait, enough, cancel";
     _autoMicSend = prefs.getBool('saved_auto_mic') ?? true;
     _voiceResponseEnabled = prefs.getBool('saved_tts_enabled') ?? true;
 
@@ -598,7 +599,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await _tts.setSpeechRate(0.53);
     await _tts.setVolume(1.0);
 
-    // Synchronize completion with an explicit Completer to completely stop sentence cutting
+    // Physically awaits completion of utterance before popping next sentence
     _tts.setCompletionHandler(() {
       if (_ttsSentenceCompleter != null && !_ttsSentenceCompleter!.isCompleted) {
         _ttsSentenceCompleter!.complete();
@@ -627,8 +628,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  /// Strictly awaits completion of each sentence before popping the next.
-  /// Eliminates sentence cutting and audio refreshes.
   Future<void> _runTtsWorker() async {
     if (_isTtsWorkerRunning) return;
     _isTtsWorkerRunning = true;
@@ -644,7 +643,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
       try {
         await _tts.speak(sentence);
-        // Wait until Android audio finishes speaking before proceeding
+        // Wait until speech completely finishes playing from the speaker
         await _ttsSentenceCompleter!.future.timeout(
           const Duration(seconds: 20),
           onTimeout: () {},
@@ -657,7 +656,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       setState(() => _currentlySpeakingMessageId = null);
 
       if (_callModeActive && !_isProcessing) {
-        // Give 300ms acoustic grace period so mic doesn't hear the speaker echo
         Future.delayed(const Duration(milliseconds: 300), () {
           if (_callModeActive && !_isProcessing) {
             _startContinuousMic();
@@ -702,48 +700,54 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  /* ---------------- UNBROKEN CALL MODE ENGINE ---------------- */
+  /* ---------------- UNBROKEN CALL MODE & TRIGGER SYSTEM ---------------- */
 
   void _toggleCallMode() {
     setState(() {
       _callModeActive = !_callModeActive;
       _isCallModeAsleep = false;
+      if (!_callModeActive) _amoledBlackoutEnabled = false;
     });
 
-    _setNativeForegroundCallService(_callModeActive);
+    _setCallModeHardware(_callModeActive);
 
     if (_callModeActive) {
       _playNativeTone("wake");
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("Call Mode Active. Runs continuously in background/screen-off."),
-          duration: Duration(seconds: 2),
-        ),
-      );
+      _startSilenceTimer();
       _startContinuousMic();
     } else {
-      _silenceCheckTimer?.cancel();
+      _silenceTimer?.cancel();
       _speechPauseTimer?.cancel();
       _speech.stop();
       _stopTts();
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Call Mode Disconnected"), duration: Duration(seconds: 1)),
-      );
     }
   }
 
   void _handleMicDisconnected() {
     if (!_callModeActive) return;
 
-    // Do NOT reconnect in an audio fight while TTS is actively playing
+    // Do NOT reconnect during TTS playback to avoid audio collision loop
     if (_isTtsWorkerRunning) return;
 
-    // Graceful reconnect avoids the rapid 200ms snapping on/off loop
-    Future.delayed(const Duration(milliseconds: 600), () {
+    Future.delayed(const Duration(milliseconds: 300), () {
       if (_callModeActive && !_isListening && !_isTtsWorkerRunning) {
         _startContinuousMic();
       }
     });
+  }
+
+  bool _matchesTriggerList(String text, String commaSeparatedTriggers) {
+    final lower = text.toLowerCase();
+    final triggers = commaSeparatedTriggers
+        .toLowerCase()
+        .split(',')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty);
+
+    for (final t in triggers) {
+      if (lower.contains(t)) return true;
+    }
+    return false;
   }
 
   void _startContinuousMic() async {
@@ -757,69 +761,71 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         final rawWords = result.recognizedWords.toLowerCase().trim();
 
         // -------------------------------------------------------------
-        // STATE 1: Model is generating text OR TTS is speaking
-        // SEPARATE MIC PROCESSING: ONLY check for Stop Word!
+        // STATE 1: Model is generating OR TTS is speaking
+        // SEPARATE PROCESSING: Only check for stop words!
         // -------------------------------------------------------------
         if (_isProcessing || _isTtsWorkerRunning) {
-          if (rawWords.contains(_stopWord.toLowerCase())) {
+          if (_matchesTriggerList(rawWords, _stopWord)) {
             _playNativeTone("stop");
             _stopGeneration();
             _stopTts();
             _textController.clear();
             _startContinuousMic();
           }
-          return; // Ignore other words so prompt words don't trigger stop
+          return;
         }
 
         // -------------------------------------------------------------
         // STATE 2: Standby Sleep Mode
-        // ONLY check for Wake Word
+        // Only check for wake words!
         // -------------------------------------------------------------
         if (_isCallModeAsleep) {
-          if (rawWords.contains(_wakeWord.toLowerCase())) {
+          if (_matchesTriggerList(rawWords, _wakeWord)) {
             _playNativeTone("wake");
             setState(() => _isCallModeAsleep = false);
             _tts.speak("I'm listening.");
-            _resetSilenceWatchdog();
+            _startSilenceTimer();
           }
           return;
         }
 
         // -------------------------------------------------------------
-        // STATE 3: Prompt Dictation Mode (Stop/Wake words allowed in text)
+        // STATE 3: Prompt Dictation (User speaking prompt)
         // -------------------------------------------------------------
-        _textController.text = result.recognizedWords;
-        _resetSilenceWatchdog();
+        if (result.recognizedWords.trim().isNotEmpty) {
+          _textController.text = result.recognizedWords;
+          // Actual words spoken -> Reset silence countdown
+          _startSilenceTimer();
 
-        _speechPauseTimer?.cancel();
-        if (_autoMicSend && result.recognizedWords.trim().isNotEmpty) {
-          _speechPauseTimer = Timer(const Duration(milliseconds: 1400), () {
-            if (_textController.text.trim().isNotEmpty && !_isProcessing) {
-              _handleSendMessage();
-            }
-          });
+          _speechPauseTimer?.cancel();
+          if (_autoMicSend) {
+            _speechPauseTimer = Timer(const Duration(milliseconds: 1400), () {
+              if (_textController.text.trim().isNotEmpty && !_isProcessing) {
+                _handleSendMessage();
+              }
+            });
+          }
         }
       },
       listenFor: const Duration(seconds: 60),
       pauseFor: const Duration(seconds: 4),
     );
-
-    _resetSilenceWatchdog();
   }
 
-  void _resetSilenceWatchdog() {
-    _silenceCheckTimer?.cancel();
+  /// Only resets when the user actually utters words
+  void _startSilenceTimer() {
+    _silenceTimer?.cancel();
     if (!_callModeActive || _isProcessing || _isCallModeAsleep || _isTtsWorkerRunning) return;
 
-    _silenceCheckTimer = Timer(const Duration(seconds: 10), () async {
+    _silenceTimer = Timer(const Duration(seconds: 10), () async {
       if (!_callModeActive || _isProcessing || _isCallModeAsleep || _isTtsWorkerRunning) return;
 
       await _tts.speak("Are you still there?");
 
-      _silenceCheckTimer = Timer(const Duration(seconds: 10), () {
+      _silenceTimer = Timer(const Duration(seconds: 10), () {
         if (!_callModeActive || _isProcessing || _isCallModeAsleep || _isTtsWorkerRunning) return;
         setState(() => _isCallModeAsleep = true);
-        _tts.speak("Standby. Say ${_wakeWord} to wake me.");
+        _tts.speak("Entering standby. Say your wake word to resume.");
       });
     });
   }
@@ -933,7 +939,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (text.isEmpty && _selectedAttachments.isEmpty) return;
 
     _speechPauseTimer?.cancel();
-    _silenceCheckTimer?.cancel();
+    _silenceTimer?.cancel();
 
     if (_loadedGgufPath == null || !File(_loadedGgufPath!).existsSync()) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1029,7 +1035,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             _scrollToBottom();
           }
 
-          // Smooth sentence-by-sentence TTS streaming (No restarts/cutting)
           if (_voiceResponseEnabled) {
             _ttsStreamBuffer += token;
             if (_ttsStreamBuffer.contains('.') ||
@@ -1285,132 +1290,189 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final currentMessages = _currentSession.messages;
 
-    return Scaffold(
-      key: _scaffoldKey,
-      drawer: _buildSessionsDrawer(),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF141721),
-        leading: IconButton(
-          tooltip: "Chat History",
-          icon: const Icon(Icons.forum_outlined, color: Colors.white70),
-          onPressed: () => _scaffoldKey.currentState?.openDrawer(),
-        ),
-        title: GestureDetector(
-          onTap: _isProcessing ? null : _selectGgufModel,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(_currentSession.title,
-                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-                  overflow: TextOverflow.ellipsis),
-              Text(
-                _modelStatus,
-                style: const TextStyle(fontSize: 10, color: Color(0xFF00D2FF)),
-                overflow: TextOverflow.ellipsis,
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          IconButton(
-            tooltip: _callModeActive ? "Call Mode: Active" : "Call Mode: Disconnected",
-            icon: Icon(
-              _callModeActive ? Icons.phone_in_talk : Icons.phone_outlined,
-              color: _callModeActive ? Colors.greenAccent : Colors.white38,
+    return Stack(
+      children: [
+        Scaffold(
+          key: _scaffoldKey,
+          drawer: _buildSessionsDrawer(),
+          appBar: AppBar(
+            backgroundColor: const Color(0xFF141721),
+            leading: IconButton(
+              tooltip: "Chat History",
+              icon: const Icon(Icons.forum_outlined, color: Colors.white70),
+              onPressed: () => _scaffoldKey.currentState?.openDrawer(),
             ),
-            onPressed: _toggleCallMode,
-          ),
-          IconButton(
-            tooltip: "New Chat",
-            icon: const Icon(Icons.add_comment_outlined, color: Color(0xFF00D2FF)),
-            onPressed: () => _createNewSession(),
-          ),
-          IconButton(
-            tooltip: _voiceResponseEnabled ? "TTS Audio: ON" : "TTS Audio: OFF",
-            icon: Icon(
-              _voiceResponseEnabled ? Icons.volume_up : Icons.volume_off,
-              color: _voiceResponseEnabled ? const Color(0xFF00D2FF) : Colors.grey,
-            ),
-            onPressed: () async {
-              setState(() => _voiceResponseEnabled = !_voiceResponseEnabled);
-              final prefs = await SharedPreferences.getInstance();
-              await prefs.setBool('saved_tts_enabled', _voiceResponseEnabled);
-              if (!_voiceResponseEnabled) _stopTts();
-            },
-          ),
-          IconButton(
-            tooltip: "Memory Bank",
-            icon: Badge(
-              isLabelVisible: _memoryBank.facts.isNotEmpty,
-              label: Text(_memoryBank.facts.length.toString()),
-              backgroundColor: const Color(0xFF6C63FF),
-              child: const Icon(Icons.psychology, color: Color(0xFF6C63FF)),
-            ),
-            onPressed: _showMemoryModal,
-          ),
-          IconButton(
-            tooltip: "Settings & Triggers",
-            icon: const Icon(Icons.settings_suggest, color: Colors.white70, size: 22),
-            onPressed: _showSettingsDialog,
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          if (_callModeActive)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 12),
-              color: _isCallModeAsleep ? Colors.amber.shade900 : Colors.green.shade900,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
+            title: GestureDetector(
+              onTap: _isProcessing ? null : _selectGgufModel,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(_isCallModeAsleep ? Icons.bedtime : Icons.headset_mic, size: 14, color: Colors.white),
-                  const SizedBox(width: 8),
+                  Text(_currentSession.title,
+                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+                      overflow: TextOverflow.ellipsis),
                   Text(
-                    _isCallModeAsleep
-                        ? "Standby. Say '$_wakeWord' to resume."
-                        : "Call Active (Screen-Off/Background). Say '$_stopWord' anytime to stop.",
-                    style: const TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.bold),
+                    _modelStatus,
+                    style: const TextStyle(fontSize: 10, color: Color(0xFF00D2FF)),
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ],
               ),
             ),
-          Expanded(
-            child: currentMessages.isEmpty
-                ? Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.bolt, size: 48, color: Colors.white.withValues(alpha: 0.2)),
-                        const SizedBox(height: 8),
-                        Text(
-                          "${_currentSession.title}\nReady to chat",
-                          textAlign: TextAlign.center,
-                          style: TextStyle(color: Colors.white.withValues(alpha: 0.4), fontSize: 13),
-                        ),
-                      ],
-                    ),
-                  )
-                : ListView.builder(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    itemCount: currentMessages.length,
-                    itemBuilder: (context, i) {
-                      final m = currentMessages[i];
-                      return _buildMessageItem(m);
-                    },
-                  ),
+            actions: [
+              IconButton(
+                tooltip: _callModeActive ? "Call Mode: Active" : "Call Mode: Disconnected",
+                icon: Icon(
+                  _callModeActive ? Icons.phone_in_talk : Icons.phone_outlined,
+                  color: _callModeActive ? Colors.greenAccent : Colors.white38,
+                ),
+                onPressed: _toggleCallMode,
+              ),
+              IconButton(
+                tooltip: "New Chat",
+                icon: const Icon(Icons.add_comment_outlined, color: Color(0xFF00D2FF)),
+                onPressed: () => _createNewSession(),
+              ),
+              IconButton(
+                tooltip: _voiceResponseEnabled ? "TTS Audio: ON" : "TTS Audio: OFF",
+                icon: Icon(
+                  _voiceResponseEnabled ? Icons.volume_up : Icons.volume_off,
+                  color: _voiceResponseEnabled ? const Color(0xFF00D2FF) : Colors.grey,
+                ),
+                onPressed: () async {
+                  setState(() => _voiceResponseEnabled = !_voiceResponseEnabled);
+                  final prefs = await SharedPreferences.getInstance();
+                  await prefs.setBool('saved_tts_enabled', _voiceResponseEnabled);
+                  if (!_voiceResponseEnabled) _stopTts();
+                },
+              ),
+              IconButton(
+                tooltip: "Memory Bank",
+                icon: Badge(
+                  isLabelVisible: _memoryBank.facts.isNotEmpty,
+                  label: Text(_memoryBank.facts.length.toString()),
+                  backgroundColor: const Color(0xFF6C63FF),
+                  child: const Icon(Icons.psychology, color: Color(0xFF6C63FF)),
+                ),
+                onPressed: _showMemoryModal,
+              ),
+              IconButton(
+                tooltip: "Settings & Triggers",
+                icon: const Icon(Icons.settings_suggest, color: Colors.white70, size: 22),
+                onPressed: _showSettingsDialog,
+              ),
+            ],
           ),
-          if (_isProcessing)
-            const LinearProgressIndicator(
-              backgroundColor: Color(0xFF141721),
-              valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF00D2FF)),
-              minHeight: 2,
+          body: Column(
+            children: [
+              if (_callModeActive)
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 12),
+                  color: _isCallModeAsleep ? Colors.amber.shade900 : Colors.green.shade900,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(_isCallModeAsleep ? Icons.bedtime : Icons.headset_mic, size: 14, color: Colors.white),
+                          const SizedBox(width: 8),
+                          Text(
+                            _isCallModeAsleep
+                                ? "Standby. Say wake word to resume."
+                                : "Continuous Call Active. Say stop word to halt.",
+                            style: const TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.bold),
+                          ),
+                        ],
+                      ),
+                      // Button to toggle black AMOLED screen for pocket mode
+                      InkWell(
+                        onTap: () => setState(() => _amoledBlackoutEnabled = true),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: Colors.black45,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: const Text("Pocket Mode", style: TextStyle(fontSize: 10, color: Colors.white70)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              Expanded(
+                child: currentMessages.isEmpty
+                    ? Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.bolt, size: 48, color: Colors.white.withValues(alpha: 0.2)),
+                            const SizedBox(height: 8),
+                            Text(
+                              "${_currentSession.title}\nContinuous Call Engine Ready",
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: Colors.white.withValues(alpha: 0.4), fontSize: 13),
+                            ),
+                          ],
+                        ),
+                      )
+                    : ListView.builder(
+                        controller: _scrollController,
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        itemCount: currentMessages.length,
+                        itemBuilder: (context, i) {
+                          final m = currentMessages[i];
+                          return _buildMessageItem(m);
+                        },
+                      ),
+              ),
+              if (_isProcessing)
+                const LinearProgressIndicator(
+                  backgroundColor: Color(0xFF141721),
+                  valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF00D2FF)),
+                  minHeight: 2,
+                ),
+              _buildInputBar(),
+            ],
+          ),
+        ),
+
+        // True Black AMOLED Pocket Overlay (keeps screen awake for Google STT without battery drain or accidental pocket touches)
+        if (_callModeActive && _amoledBlackoutEnabled)
+          Positioned.fill(
+            child: Container(
+              color: Colors.black,
+              child: SafeArea(
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _isCallModeAsleep ? Icons.bedtime : Icons.graphic_eq,
+                        size: 48,
+                        color: _isCallModeAsleep ? Colors.amber : Colors.greenAccent,
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        _isCallModeAsleep
+                            ? "Standby Mode\nSay '$_wakeWord' to wake"
+                            : "Call Active in Pocket\nSpeak normally • Say '$_stopWord' to stop",
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.white70, fontSize: 13),
+                      ),
+                      const SizedBox(height: 32),
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(foregroundColor: Colors.white60),
+                        icon: const Icon(Icons.lock_open, size: 16),
+                        label: const Text("Exit Pocket Mode"),
+                        onPressed: () => setState(() => _amoledBlackoutEnabled = false),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             ),
-          _buildInputBar(),
-        ],
-      ),
+          ),
+      ],
     );
   }
 
@@ -1713,28 +1775,28 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     },
                   ),
                   const Divider(color: Colors.white10),
-                  const Text("Barge-In Stop Word:", style: TextStyle(fontSize: 12, color: Colors.white70, fontWeight: FontWeight.bold)),
-                  const Text("Stops response & speech while model is talking.", style: TextStyle(fontSize: 10, color: Colors.white38)),
+                  const Text("Barge-In Stop Triggers (comma-separated):", style: TextStyle(fontSize: 12, color: Colors.white70, fontWeight: FontWeight.bold)),
+                  const Text("Stops model response while it is speaking/generating.", style: TextStyle(fontSize: 10, color: Colors.white38)),
                   const SizedBox(height: 4),
                   TextField(
                     controller: stopCtrl,
                     style: const TextStyle(color: Colors.white, fontSize: 13),
                     decoration: InputDecoration(
-                      hintText: "e.g. stop, wait, enough",
+                      hintText: "e.g. stop, wait, enough, cancel",
                       filled: true,
                       fillColor: const Color(0xFF141721),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
                     ),
                   ),
                   const SizedBox(height: 12),
-                  const Text("Ambient Wake-Up Word:", style: TextStyle(fontSize: 12, color: Colors.white70, fontWeight: FontWeight.bold)),
-                  const Text("Wakes model from standby after 20s of silence.", style: TextStyle(fontSize: 10, color: Colors.white38)),
+                  const Text("Standby Wake Triggers (comma-separated):", style: TextStyle(fontSize: 12, color: Colors.white70, fontWeight: FontWeight.bold)),
+                  const Text("Wakes model from standby after silence.", style: TextStyle(fontSize: 10, color: Colors.white38)),
                   const SizedBox(height: 4),
                   TextField(
                     controller: wakeCtrl,
                     style: const TextStyle(color: Colors.white, fontSize: 13),
                     decoration: InputDecoration(
-                      hintText: "e.g. wake up, hey companion",
+                      hintText: "e.g. wake up, hey, listen",
                       filled: true,
                       fillColor: const Color(0xFF141721),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
@@ -1753,8 +1815,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 child: const Text("Save Triggers"),
                 onPressed: () async {
                   setState(() {
-                    _stopWord = stopCtrl.text.trim().isNotEmpty ? stopCtrl.text.trim() : "stop";
-                    _wakeWord = wakeCtrl.text.trim().isNotEmpty ? wakeCtrl.text.trim() : "wake up";
+                    _stopWord = stopCtrl.text.trim().isNotEmpty ? stopCtrl.text.trim() : "stop, wait, enough, cancel";
+                    _wakeWord = wakeCtrl.text.trim().isNotEmpty ? wakeCtrl.text.trim() : "wake up, hey, listen";
                   });
                   final prefs = await SharedPreferences.getInstance();
                   await prefs.setString('saved_stop_word', _stopWord);
