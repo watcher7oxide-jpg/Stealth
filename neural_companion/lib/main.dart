@@ -208,7 +208,7 @@ class LearnedMemoryFact {
   final String id;
   final String fact;
   final String reasoning;
-  final String importance; // High, Medium, Context
+  final String importance; // High, Medium
   final String category;   // Identity, Preference, Directive, Discussion
   final DateTime learnedAt;
 
@@ -234,7 +234,7 @@ class LearnedMemoryFact {
       LearnedMemoryFact(
         id: json['id'] ?? '',
         fact: json['fact'] ?? '',
-        reasoning: json['reasoning'] ?? 'Extracted from conversation turn',
+        reasoning: json['reasoning'] ?? 'Captured interaction',
         importance: json['importance'] ?? 'Medium',
         category: json['category'] ?? 'General',
         learnedAt:
@@ -262,14 +262,12 @@ class CognitiveMemoryBank {
     }
   }
 
-  /// Compact system context: feeds highest-priority facts first
   String buildSystemContext() {
     final buffer = StringBuffer();
     buffer.write("You are an intelligent, concise personal AI. Answer questions directly without repeating phrases. ");
 
     if (facts.isNotEmpty) {
       buffer.write("Important facts to remember: ");
-      // Prioritize High importance facts (Identity, Preferences, Directives)
       final prioritized = List<LearnedMemoryFact>.from(facts)
         ..sort((a, b) {
           if (a.importance == "High" && b.importance != "High") return -1;
@@ -335,17 +333,27 @@ class _ChatScreenState extends State<ChatScreen> {
   final CognitiveMemoryBank _memoryBank = CognitiveMemoryBank();
   final LlamaController _llama = LlamaController();
 
-  // Voice & Audio State
+  // Voice & Audio State (SPEAKER ON BY DEFAULT)
   final stt.SpeechToText _speech = stt.SpeechToText();
   final FlutterTts _tts = FlutterTts();
   bool _speechEnabled = false;
   bool _isListening = false;
-  bool _voiceResponseEnabled = false;
+  bool _voiceResponseEnabled = true; // <-- Default ON
+  bool _autoMicSend = true;          // <-- Auto-send message when speech ends
 
-  // Active audio player tracker
+  // Hands-Free Ambient Voice Mode State
+  bool _handsFreeMode = false;
+  bool _isHandsFreeAsleep = false;
+  String _wakeWord = "wake up";
+  String _stopWord = "stop";
+
+  Timer? _silenceTimer;
+  Timer? _speechPauseTimer;
+
+  // Active audio player tracker & Sequential worker
   String? _currentlySpeakingMessageId;
   final List<String> _ttsQueue = [];
-  bool _isTtsProcessingQueue = false;
+  bool _isTtsWorkerRunning = false;
   String _ttsStreamBuffer = "";
 
   // Inference state
@@ -386,6 +394,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    _silenceTimer?.cancel();
+    _speechPauseTimer?.cancel();
     _activeInferenceSubscription?.cancel();
     _textController.dispose();
     _scrollController.dispose();
@@ -465,6 +475,11 @@ class _ChatScreenState extends State<ChatScreen> {
     if (savedPath != null && await File(savedPath).exists()) {
       _bindModel(savedPath);
     }
+    _wakeWord = prefs.getString('saved_wake_word') ?? "wake up";
+    _stopWord = prefs.getString('saved_stop_word') ?? "stop";
+    _autoMicSend = prefs.getBool('saved_auto_mic') ?? true;
+    _voiceResponseEnabled = prefs.getBool('saved_tts_enabled') ?? true;
+
     await _loadMemoryFromDisk();
     await _loadSessionsFromDisk();
   }
@@ -548,10 +563,16 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _initSpeechEngine() async {
     try {
       _speechEnabled = await _speech.initialize(
-        onError: (_) => setState(() => _isListening = false),
+        onError: (_) {
+          if (mounted) setState(() => _isListening = false);
+        },
         onStatus: (val) {
           if (val == 'done' || val == 'notListening') {
-            setState(() => _isListening = false);
+            if (mounted) setState(() => _isListening = false);
+            // If in hands-free mode and not processing, handle silence or wake detection
+            if (_handsFreeMode && !_isProcessing && !_isHandsFreeAsleep) {
+              _startHandsFreeSilenceTimer();
+            }
           }
         },
       );
@@ -563,23 +584,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _initTtsEngine() async {
     await _tts.setLanguage("en-US");
-    await _tts.setSpeechRate(0.55);
+    await _tts.setSpeechRate(0.53);
     await _tts.setVolume(1.0);
 
-    _tts.setCompletionHandler(() {
-      _isTtsProcessingQueue = false;
-      _processNextTtsQueueItem();
-    });
-
-    _tts.setErrorHandler((_) {
-      if (mounted) {
-        setState(() {
-          _isTtsProcessingQueue = false;
-          _currentlySpeakingMessageId = null;
-        });
-      }
-    });
+    // CRITICAL: Await completion prevents Android TTS from cutting off new sentences
+    await _tts.awaitSpeakCompletion(true);
   }
+
+  /* ---------------- NON-BLOCKING SEQUENTIAL TTS WORKER ---------------- */
 
   void _enqueueTtsText(String sentence, {String? messageId}) {
     final clean = sentence.trim();
@@ -591,25 +603,40 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     _ttsQueue.add(clean);
-    _processNextTtsQueueItem();
+    if (!_isTtsWorkerRunning) {
+      _runTtsWorker();
+    }
   }
 
-  Future<void> _processNextTtsQueueItem() async {
-    if (_isTtsProcessingQueue || _ttsQueue.isEmpty) {
-      if (_ttsQueue.isEmpty && _currentlySpeakingMessageId != null) {
-        setState(() => _currentlySpeakingMessageId = null);
+  Future<void> _runTtsWorker() async {
+    if (_isTtsWorkerRunning) return;
+    _isTtsWorkerRunning = true;
+
+    while (_ttsQueue.isNotEmpty) {
+      if (!_voiceResponseEnabled && _currentlySpeakingMessageId == null) {
+        _ttsQueue.clear();
+        break;
       }
-      return;
+
+      final sentence = _ttsQueue.removeAt(0);
+      try {
+        await _tts.speak(sentence);
+      } catch (_) {}
     }
 
-    _isTtsProcessingQueue = true;
-    final nextText = _ttsQueue.removeAt(0);
-    await _tts.speak(nextText);
+    _isTtsWorkerRunning = false;
+    if (_ttsQueue.isEmpty && mounted) {
+      setState(() => _currentlySpeakingMessageId = null);
+      // Continuous loop: Listen to user immediately after assistant completes speaking
+      if (_handsFreeMode && !_isProcessing) {
+        _startHandsFreeListening();
+      }
+    }
   }
 
   Future<void> _stopTts() async {
     _ttsQueue.clear();
-    _isTtsProcessingQueue = false;
+    _isTtsWorkerRunning = false;
     _ttsStreamBuffer = "";
     await _tts.stop();
     if (mounted) {
@@ -635,8 +662,109 @@ class _ChatScreenState extends State<ChatScreen> {
       }
 
       _ttsQueue.addAll(sentences);
-      _processNextTtsQueueItem();
+      _runTtsWorker();
     }
+  }
+
+  /* ---------------- HANDS-FREE AMBIENT & BARGE-IN SYSTEM ---------------- */
+
+  void _toggleHandsFreeMode() {
+    setState(() {
+      _handsFreeMode = !_handsFreeMode;
+      _isHandsFreeAsleep = false;
+    });
+
+    if (_handsFreeMode) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Hands-Free Mode Active. Speak anytime or say Stop to halt."),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      _startHandsFreeListening();
+    } else {
+      _silenceTimer?.cancel();
+      _speechPauseTimer?.cancel();
+      _speech.stop();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Hands-Free Mode Deactivated"), duration: Duration(seconds: 1)),
+      );
+    }
+  }
+
+  void _startHandsFreeListening() async {
+    if (!_speechEnabled || !_handsFreeMode) return;
+
+    _silenceTimer?.cancel();
+    _speechPauseTimer?.cancel();
+
+    if (_isListening) await _speech.stop();
+
+    setState(() => _isListening = true);
+
+    await _speech.listen(
+      onResult: (SpeechRecognitionResult result) {
+        final recognized = result.recognizedWords.toLowerCase().trim();
+
+        // 1. BARGE-IN: User says stop word while generating or speaking
+        if ((_isProcessing || _isTtsWorkerRunning) && recognized.contains(_stopWord.toLowerCase())) {
+          HapticFeedback.heavyImpact();
+          _stopGeneration();
+          _stopTts();
+          _textController.clear();
+          return;
+        }
+
+        // 2. WAKE WORD: User wakes model from standby
+        if (_isHandsFreeAsleep) {
+          if (recognized.contains(_wakeWord.toLowerCase())) {
+            HapticFeedback.mediumImpact();
+            setState(() => _isHandsFreeAsleep = false);
+            _tts.speak("I'm listening.");
+          }
+          return;
+        }
+
+        // 3. Normal speech recognition in active mode
+        if (!_isProcessing) {
+          _textController.text = result.recognizedWords;
+
+          // Restart pause timer for auto-send
+          _speechPauseTimer?.cancel();
+          if (_autoMicSend && result.recognizedWords.trim().isNotEmpty) {
+            _speechPauseTimer = Timer(const Duration(milliseconds: 1400), () {
+              if (_textController.text.trim().isNotEmpty && !_isProcessing) {
+                _handleSendMessage();
+              }
+            });
+          }
+        }
+      },
+      listenFor: const Duration(seconds: 30),
+      pauseFor: const Duration(seconds: 5),
+    );
+
+    _startHandsFreeSilenceTimer();
+  }
+
+  void _startHandsFreeSilenceTimer() {
+    _silenceTimer?.cancel();
+    if (!_handsFreeMode || _isProcessing || _isHandsFreeAsleep) return;
+
+    // 10-Second Silence Check-In
+    _silenceTimer = Timer(const Duration(seconds: 10), () async {
+      if (!_handsFreeMode || _isProcessing || _isHandsFreeAsleep) return;
+
+      await _tts.speak("Are you still there?");
+
+      // Second 10-second silence before entering Sleep Standby
+      _silenceTimer = Timer(const Duration(seconds: 10), () {
+        if (!_handsFreeMode || _isProcessing || _isHandsFreeAsleep) return;
+        setState(() => _isHandsFreeAsleep = true);
+        _speech.stop();
+        _tts.speak("Entering sleep mode. Say ${_wakeWord} to wake me.");
+      });
+    });
   }
 
   /* ---------------- GGUF BINDER ---------------- */
@@ -747,6 +875,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final text = _textController.text.trim();
     if (text.isEmpty && _selectedAttachments.isEmpty) return;
 
+    _speechPauseTimer?.cancel();
+    _silenceTimer?.cancel();
+
     if (_isListening) {
       await _speech.stop();
       _isListening = false;
@@ -762,12 +893,12 @@ class _ChatScreenState extends State<ChatScreen> {
     await _stopTts();
     _ttsStreamBuffer = "";
 
-    final outgoingAttachments = List<AttachmentItem>.from(_selectedAttachments);
+    // Processing Beep / Audio Haptic Feedback
+    HapticFeedback.lightImpact();
 
-    // 1. Build prompt context BEFORE mutating state
+    final outgoingAttachments = List<AttachmentItem>.from(_selectedAttachments);
     final prompt = _buildCleanContextPrompt(text, outgoingAttachments);
 
-    // 2. Add Messages to the current session
     final userMsg = ChatMessage(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       text: text,
@@ -790,7 +921,6 @@ class _ChatScreenState extends State<ChatScreen> {
       _currentSession.messages.add(assistantMsg);
       _currentSession.lastModified = DateTime.now();
 
-      // Auto-name conversation title if still default
       if (_currentSession.title.startsWith("Conversation") ||
           _currentSession.title == "New Conversation") {
         _currentSession.title = text.length > 24 ? "${text.substring(0, 24)}..." : text;
@@ -804,7 +934,6 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToBottom();
     await _saveSessionsToDisk();
 
-    // 3. Clear KV cache to prevent token collision / loops
     try {
       await _llama.clearContext();
     } catch (_) {}
@@ -847,7 +976,7 @@ class _ChatScreenState extends State<ChatScreen> {
           });
           _scrollToBottom();
 
-          // Sentence-by-sentence TTS
+          // Smooth sentence-by-sentence TTS streaming (No restarts/cutting)
           if (_voiceResponseEnabled) {
             _ttsStreamBuffer += token;
             if (_ttsStreamBuffer.contains('.') ||
@@ -906,7 +1035,6 @@ class _ChatScreenState extends State<ChatScreen> {
       _scrollToBottom();
       await _saveSessionsToDisk();
 
-      // Distill turn into the Cognitive Memory Bank with explicit reasoning
       _distillAndStoreMemory(text, finalReply);
     } catch (e, stack) {
       setState(() => _isProcessing = false);
@@ -917,12 +1045,10 @@ class _ChatScreenState extends State<ChatScreen> {
   String _buildCleanContextPrompt(String currentInput, List<AttachmentItem> attachments) {
     final buffer = StringBuffer();
 
-    // 1. System Prompt with High/Medium facts
     buffer.writeln("<|im_start|>system");
     buffer.writeln(_memoryBank.buildSystemContext());
     buffer.writeln("<|im_end|>");
 
-    // 2. Rolling history from the CURRENT active session (last 2 full turns MAX)
     final existing = _currentSession.messages.where((m) => m.text.isNotEmpty).toList();
     final slice = existing.length > 2
         ? existing.sublist(existing.length - 2)
@@ -936,7 +1062,6 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     }
 
-    // 3. Attachments preview
     final StringBuffer attachmentText = StringBuffer();
     for (final a in attachments) {
       if (a.bytes != null && !a.isImage && a.size < 50000) {
@@ -949,7 +1074,6 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     }
 
-    // 4. Current user prompt
     buffer.writeln("<|im_start|>user");
     if (attachmentText.isNotEmpty) {
       buffer.write(attachmentText.toString());
@@ -974,7 +1098,6 @@ class _ChatScreenState extends State<ChatScreen> {
       String reasoning = "General knowledge and context from conversation turn.";
       String distilledFact = cleanPrompt;
 
-      // 1. Identity Detection (Highest Priority)
       if (lower.contains("my name is") ||
           lower.contains("call me") ||
           lower.startsWith("i am ") ||
@@ -985,9 +1108,7 @@ class _ChatScreenState extends State<ChatScreen> {
         importance = "High";
         reasoning = "Core user identity and biographical declaration.";
         distilledFact = cleanPrompt;
-      }
-      // 2. Preference Detection (High Priority)
-      else if (lower.contains("i like") ||
+      } else if (lower.contains("i like") ||
           lower.contains("i love") ||
           lower.contains("i prefer") ||
           lower.contains("i hate") ||
@@ -997,9 +1118,7 @@ class _ChatScreenState extends State<ChatScreen> {
         importance = "High";
         reasoning = "User expression of preference to tailor future assistance.";
         distilledFact = cleanPrompt;
-      }
-      // 3. Directives & Instructions (High Priority)
-      else if (lower.contains("remember") ||
+      } else if (lower.contains("remember") ||
           lower.contains("don't forget") ||
           lower.contains("always") ||
           lower.contains("never")) {
@@ -1007,26 +1126,21 @@ class _ChatScreenState extends State<ChatScreen> {
         importance = "High";
         reasoning = "Explicit instruction by user for permanent retention.";
         distilledFact = cleanPrompt;
-      }
-      // 4. General Topical Discussion (Medium Priority)
-      else if (cleanPrompt.length >= 10 && cleanReply.length >= 10) {
+      } else if (cleanPrompt.length >= 10 && cleanReply.length >= 10) {
         category = "Discussion";
         importance = "Medium";
         reasoning = "Key exchange regarding topic and context.";
         final shortReply = cleanReply.length > 70 ? "${cleanReply.substring(0, 70)}..." : cleanReply;
         distilledFact = "User asked: \"$cleanPrompt\" | Summary: $shortReply";
       } else {
-        // Skip short noise like "ok", "cool", "thanks"
         return;
       }
 
-      // Check for duplicate fact
       final existingIndex = _memoryBank.facts.indexWhere(
         (f) => f.fact.toLowerCase() == distilledFact.toLowerCase(),
       );
 
       if (existingIndex != -1) {
-        // Update timestamp of existing fact
         _memoryBank.facts[existingIndex] = LearnedMemoryFact(
           id: _memoryBank.facts[existingIndex].id,
           fact: distilledFact,
@@ -1036,7 +1150,6 @@ class _ChatScreenState extends State<ChatScreen> {
           learnedAt: DateTime.now(),
         );
       } else {
-        // Insert new evaluated fact at top
         _memoryBank.facts.insert(
           0,
           LearnedMemoryFact(
@@ -1050,7 +1163,6 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
 
-      // Keep maximum 80 evaluated facts
       if (_memoryBank.facts.length > 80) {
         _memoryBank.facts = _memoryBank.facts.sublist(0, 80);
       }
@@ -1146,19 +1258,31 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ),
         actions: [
+          // Hands-Free Ambient Mode Toggle
+          IconButton(
+            tooltip: _handsFreeMode ? "Ambient Hands-Free: ON" : "Ambient Hands-Free: OFF",
+            icon: Icon(
+              _handsFreeMode ? Icons.record_voice_over : Icons.voice_over_off,
+              color: _handsFreeMode ? Colors.greenAccent : Colors.white38,
+            ),
+            onPressed: _toggleHandsFreeMode,
+          ),
           IconButton(
             tooltip: "New Chat",
             icon: const Icon(Icons.add_comment_outlined, color: Color(0xFF00D2FF)),
             onPressed: () => _createNewSession(),
           ),
+          // Master Audio Toggle
           IconButton(
-            tooltip: _voiceResponseEnabled ? "TTS Auto: On" : "TTS Auto: Off",
+            tooltip: _voiceResponseEnabled ? "TTS Audio: ON" : "TTS Audio: OFF",
             icon: Icon(
               _voiceResponseEnabled ? Icons.volume_up : Icons.volume_off,
               color: _voiceResponseEnabled ? const Color(0xFF00D2FF) : Colors.grey,
             ),
-            onPressed: () {
+            onPressed: () async {
               setState(() => _voiceResponseEnabled = !_voiceResponseEnabled);
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setBool('saved_tts_enabled', _voiceResponseEnabled);
               if (!_voiceResponseEnabled) _stopTts();
             },
           ),
@@ -1173,14 +1297,33 @@ class _ChatScreenState extends State<ChatScreen> {
             onPressed: _showMemoryModal,
           ),
           IconButton(
-            tooltip: "Logs",
-            icon: const Icon(Icons.terminal, color: Colors.amberAccent, size: 20),
-            onPressed: _showDeviceLogcat,
+            tooltip: "Settings & Triggers",
+            icon: const Icon(Icons.settings_suggest, color: Colors.white70, size: 22),
+            onPressed: _showSettingsDialog,
           ),
         ],
       ),
       body: Column(
         children: [
+          if (_handsFreeMode)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
+              color: _isHandsFreeAsleep ? Colors.amber.shade900 : Colors.green.shade900,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(_isHandsFreeAsleep ? Icons.bedtime : Icons.graphic_eq, size: 14, color: Colors.white),
+                  const SizedBox(width: 6),
+                  Text(
+                    _isHandsFreeAsleep
+                        ? "Standby. Say '$_wakeWord' to wake."
+                        : "Hands-Free Active. Say '$_stopWord' anytime to interrupt.",
+                    style: const TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+            ),
           Expanded(
             child: currentMessages.isEmpty
                 ? Center(
@@ -1402,23 +1545,51 @@ class _ChatScreenState extends State<ChatScreen> {
                       }
                     },
             ),
+            // Auto-Mic Indicator / Mic Button
             IconButton(
-              icon: Icon(
-                _isListening ? Icons.mic : Icons.mic_none,
-                color: _isListening ? Colors.redAccent : Colors.white70,
+              tooltip: _autoMicSend ? "Auto-Send Mic: ON" : "Manual Mic: ON",
+              icon: Stack(
+                alignment: Alignment.topRight,
+                children: [
+                  Icon(
+                    _isListening ? Icons.mic : Icons.mic_none,
+                    color: _isListening ? Colors.redAccent : Colors.white70,
+                  ),
+                  if (_autoMicSend)
+                    Container(
+                      width: 7,
+                      height: 7,
+                      decoration: const BoxDecoration(
+                        color: Colors.greenAccent,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                ],
               ),
               onPressed: _isProcessing
                   ? null
                   : () async {
                       if (!_speechEnabled) return;
                       if (_isListening) {
+                        _speechPauseTimer?.cancel();
                         await _speech.stop();
                         setState(() => _isListening = false);
                       } else {
                         setState(() => _isListening = true);
-                        await _speech.listen(onResult: (SpeechRecognitionResult result) {
-                          setState(() => _textController.text = result.recognizedWords);
-                        });
+                        await _speech.listen(
+                          onResult: (SpeechRecognitionResult result) {
+                            setState(() => _textController.text = result.recognizedWords);
+
+                            _speechPauseTimer?.cancel();
+                            if (_autoMicSend && result.recognizedWords.trim().isNotEmpty) {
+                              _speechPauseTimer = Timer(const Duration(milliseconds: 1400), () {
+                                if (_textController.text.trim().isNotEmpty && !_isProcessing) {
+                                  _handleSendMessage();
+                                }
+                              });
+                            }
+                          },
+                        );
                       }
                     },
             ),
@@ -1429,9 +1600,9 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: const TextStyle(color: Colors.white),
                 decoration: InputDecoration(
                   hintText: _isProcessing
-                      ? "Assistant is responding..."
+                      ? "Generating..."
                       : _isListening
-                          ? "Listening..."
+                          ? (_autoMicSend ? "Listening (Auto-Send)..." : "Listening...")
                           : "Message companion...",
                   hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.3)),
                   filled: true,
@@ -1455,6 +1626,92 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /* ---------------- SETTINGS & TRIGGER WORDS MODAL ---------------- */
+
+  void _showSettingsDialog() {
+    final wakeCtrl = TextEditingController(text: _wakeWord);
+    final stopCtrl = TextEditingController(text: _stopWord);
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDlgState) {
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1E2230),
+            title: const Text("Options & Voice Triggers", style: TextStyle(color: Colors.white, fontSize: 16)),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text("Auto-Send After Speaking", style: TextStyle(fontSize: 13, color: Colors.white)),
+                    subtitle: const Text("Automatically submits message after 1.5s pause", style: TextStyle(fontSize: 11, color: Colors.white38)),
+                    value: _autoMicSend,
+                    activeColor: const Color(0xFF00D2FF),
+                    onChanged: (val) async {
+                      setDlgState(() => _autoMicSend = val);
+                      setState(() => _autoMicSend = val);
+                      final prefs = await SharedPreferences.getInstance();
+                      await prefs.setBool('saved_auto_mic', val);
+                    },
+                  ),
+                  const Divider(color: Colors.white10),
+                  const Text("Barge-In Stop Word:", style: TextStyle(fontSize: 12, color: Colors.white70, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  TextField(
+                    controller: stopCtrl,
+                    style: const TextStyle(color: Colors.white, fontSize: 13),
+                    decoration: InputDecoration(
+                      hintText: "e.g. stop, wait, enough",
+                      filled: true,
+                      fillColor: const Color(0xFF141721),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text("Ambient Wake-Up Word:", style: TextStyle(fontSize: 12, color: Colors.white70, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  TextField(
+                    controller: wakeCtrl,
+                    style: const TextStyle(color: Colors.white, fontSize: 13),
+                    decoration: InputDecoration(
+                      hintText: "e.g. wake up, hey companion",
+                      filled: true,
+                      fillColor: const Color(0xFF141721),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                child: const Text("Cancel"),
+                onPressed: () => Navigator.pop(ctx),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF6C63FF)),
+                child: const Text("Save Triggers"),
+                onPressed: () async {
+                  setState(() {
+                    _stopWord = stopCtrl.text.trim().isNotEmpty ? stopCtrl.text.trim() : "stop";
+                    _wakeWord = wakeCtrl.text.trim().isNotEmpty ? wakeCtrl.text.trim() : "wake up";
+                  });
+                  final prefs = await SharedPreferences.getInstance();
+                  await prefs.setString('saved_stop_word', _stopWord);
+                  await prefs.setString('saved_wake_word', _wakeWord);
+                  Navigator.pop(ctx);
+                },
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -1613,44 +1870,6 @@ class _ChatScreenState extends State<ChatScreen> {
           },
         );
       },
-    );
-  }
-
-  Future<void> _showDeviceLogcat() async {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF141721),
-        title: const Text("Device System Logs", style: TextStyle(color: Color(0xFF00D2FF), fontSize: 16)),
-        content: FutureBuilder<ProcessResult>(
-          future: Process.run('logcat', ['-d', '-v', 'brief', '-t', '150']),
-          builder: (context, snapshot) {
-            if (snapshot.connectionState == ConnectionState.waiting) {
-              return const SizedBox(
-                height: 120,
-                child: Center(child: CircularProgressIndicator()),
-              );
-            }
-            final logs = snapshot.data?.stdout?.toString() ?? "No logcat output available";
-            return SizedBox(
-              width: double.maxFinite,
-              height: 400,
-              child: SingleChildScrollView(
-                child: SelectableText(
-                  logs,
-                  style: const TextStyle(fontSize: 10, fontFamily: 'monospace', color: Colors.white70),
-                ),
-              ),
-            );
-          },
-        ),
-        actions: [
-          TextButton(
-            child: const Text("Close"),
-            onPressed: () => Navigator.pop(ctx),
-          ),
-        ],
-      ),
     );
   }
 }
