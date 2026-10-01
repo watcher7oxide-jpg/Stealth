@@ -208,8 +208,8 @@ class LearnedMemoryFact {
   final String id;
   final String fact;
   final String reasoning;
-  final String importance; // High, Medium
-  final String category;   // Identity, Preference, Directive, Discussion
+  final String importance;
+  final String category;
   final DateTime learnedAt;
 
   LearnedMemoryFact({
@@ -324,24 +324,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final ScrollController _scrollController = ScrollController();
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
-  // Multi-Session Chat State
   final List<ChatSession> _sessions = [];
   String? _currentSessionId;
   final List<AttachmentItem> _selectedAttachments = [];
 
-  // Memory & Engine State
   final CognitiveMemoryBank _memoryBank = CognitiveMemoryBank();
   final LlamaController _llama = LlamaController();
 
-  // Voice & Audio State (SPEAKER ON BY DEFAULT)
   final stt.SpeechToText _speech = stt.SpeechToText();
   final FlutterTts _tts = FlutterTts();
   bool _speechEnabled = false;
   bool _isListening = false;
-  bool _voiceResponseEnabled = true; // <-- Default ON
+  bool _voiceResponseEnabled = true; // Default ON
   bool _autoMicSend = true;
 
-  // Continuous Call-Style Ambient Mode
+  // Unbroken Call Mode
   bool _callModeActive = false;
   bool _isCallModeAsleep = false;
   String _wakeWord = "wake up";
@@ -355,6 +352,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final List<String> _ttsQueue = [];
   bool _isTtsWorkerRunning = false;
   String _ttsStreamBuffer = "";
+  Completer<void>? _ttsSentenceCompleter;
 
   // Inference state
   String? _loadedGgufPath;
@@ -396,7 +394,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _setNativeWakeLock(false);
+    _setNativeForegroundCallService(false);
     _silenceCheckTimer?.cancel();
     _speechPauseTimer?.cancel();
     _activeInferenceSubscription?.cancel();
@@ -408,17 +406,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    // If Call Mode is active, maintain WakeLock regardless of lifecycle
-    if (_callModeActive) {
-      _setNativeWakeLock(true);
-    }
-  }
-
-  Future<void> _setNativeWakeLock(bool enable) async {
+  Future<void> _setNativeForegroundCallService(bool enable) async {
     try {
-      await _nativeChannel.invokeMethod('setWakeLock', {'enable': enable});
+      await _nativeChannel.invokeMethod('setCallService', {'enable': enable});
     } catch (_) {}
   }
 
@@ -547,7 +537,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     if (showSnackbar && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Started a new chat session"), duration: Duration(seconds: 1)),
+        const SnackBar(content: Text("Started new chat session"), duration: Duration(seconds: 1)),
       );
     }
   }
@@ -581,19 +571,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await _saveSessionsToDisk();
   }
 
-  /* ---------------- AUDIO & TTS ENGINE ---------------- */
+  /* ---------------- AUDIO & STRICT TTS COMPLETION QUEUE ---------------- */
 
   Future<void> _initSpeechEngine() async {
     try {
       _speechEnabled = await _speech.initialize(
         onError: (_) {
           if (mounted) setState(() => _isListening = false);
-          _ensureCallModeMicReconnection();
+          _handleMicDisconnected();
         },
         onStatus: (val) {
           if (val == 'done' || val == 'notListening') {
             if (mounted) setState(() => _isListening = false);
-            _ensureCallModeMicReconnection();
+            _handleMicDisconnected();
           }
         },
       );
@@ -608,8 +598,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await _tts.setSpeechRate(0.53);
     await _tts.setVolume(1.0);
 
-    // CRITICAL: Awaiting speak completion prevents cut-offs or restarting on new sentences
-    await _tts.awaitSpeakCompletion(true);
+    // Synchronize completion with an explicit Completer to completely stop sentence cutting
+    _tts.setCompletionHandler(() {
+      if (_ttsSentenceCompleter != null && !_ttsSentenceCompleter!.isCompleted) {
+        _ttsSentenceCompleter!.complete();
+      }
+    });
+
+    _tts.setErrorHandler((_) {
+      if (_ttsSentenceCompleter != null && !_ttsSentenceCompleter!.isCompleted) {
+        _ttsSentenceCompleter!.complete();
+      }
+    });
   }
 
   void _enqueueTtsText(String sentence, {String? messageId}) {
@@ -627,6 +627,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// Strictly awaits completion of each sentence before popping the next.
+  /// Eliminates sentence cutting and audio refreshes.
   Future<void> _runTtsWorker() async {
     if (_isTtsWorkerRunning) return;
     _isTtsWorkerRunning = true;
@@ -638,8 +640,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
 
       final sentence = _ttsQueue.removeAt(0);
+      _ttsSentenceCompleter = Completer<void>();
+
       try {
         await _tts.speak(sentence);
+        // Wait until Android audio finishes speaking before proceeding
+        await _ttsSentenceCompleter!.future.timeout(
+          const Duration(seconds: 20),
+          onTimeout: () {},
+        );
       } catch (_) {}
     }
 
@@ -647,15 +656,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (_ttsQueue.isEmpty && mounted) {
       setState(() => _currentlySpeakingMessageId = null);
 
-      // In Call Mode: Restart prompt listening as soon as speech finishes
       if (_callModeActive && !_isProcessing) {
-        _startContinuousMic();
+        // Give 300ms acoustic grace period so mic doesn't hear the speaker echo
+        Future.delayed(const Duration(milliseconds: 300), () {
+          if (_callModeActive && !_isProcessing) {
+            _startContinuousMic();
+          }
+        });
       }
     }
   }
 
   Future<void> _stopTts() async {
     _ttsQueue.clear();
+    if (_ttsSentenceCompleter != null && !_ttsSentenceCompleter!.isCompleted) {
+      _ttsSentenceCompleter!.complete();
+    }
     _isTtsWorkerRunning = false;
     _ttsStreamBuffer = "";
     await _tts.stop();
@@ -686,7 +702,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  /* ---------------- CALL-STYLE CONTINUOUS MIC ENGINE ---------------- */
+  /* ---------------- UNBROKEN CALL MODE ENGINE ---------------- */
 
   void _toggleCallMode() {
     setState(() {
@@ -694,13 +710,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _isCallModeAsleep = false;
     });
 
-    _setNativeWakeLock(_callModeActive);
+    _setNativeForegroundCallService(_callModeActive);
 
     if (_callModeActive) {
       _playNativeTone("wake");
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text("Call Mode Active. Continuous mic connected."),
+          content: Text("Call Mode Active. Runs continuously in background/screen-off."),
           duration: Duration(seconds: 2),
         ),
       );
@@ -716,12 +732,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  /// Automatically keeps mic alive just like an active phone call
-  void _ensureCallModeMicReconnection() {
+  void _handleMicDisconnected() {
     if (!_callModeActive) return;
 
-    Future.delayed(const Duration(milliseconds: 200), () {
-      if (_callModeActive && !_isListening) {
+    // Do NOT reconnect in an audio fight while TTS is actively playing
+    if (_isTtsWorkerRunning) return;
+
+    // Graceful reconnect avoids the rapid 200ms snapping on/off loop
+    Future.delayed(const Duration(milliseconds: 600), () {
+      if (_callModeActive && !_isListening && !_isTtsWorkerRunning) {
         _startContinuousMic();
       }
     });
@@ -729,7 +748,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _startContinuousMic() async {
     if (!_speechEnabled || !_callModeActive) return;
-
     if (_isListening) return;
 
     setState(() => _isListening = true);
@@ -748,10 +766,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             _stopGeneration();
             _stopTts();
             _textController.clear();
-            _startContinuousMic(); // Keep listening for next prompt
+            _startContinuousMic();
           }
-          // Do NOT append to prompt while model is responding
-          return;
+          return; // Ignore other words so prompt words don't trigger stop
         }
 
         // -------------------------------------------------------------
@@ -769,12 +786,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         }
 
         // -------------------------------------------------------------
-        // STATE 3: Prompt Dictation Mode (Stop/Wake words are allowed in text)
+        // STATE 3: Prompt Dictation Mode (Stop/Wake words allowed in text)
         // -------------------------------------------------------------
         _textController.text = result.recognizedWords;
         _resetSilenceWatchdog();
 
-        // Detect user pause to auto-send
         _speechPauseTimer?.cancel();
         if (_autoMicSend && result.recognizedWords.trim().isNotEmpty) {
           _speechPauseTimer = Timer(const Duration(milliseconds: 1400), () {
@@ -793,17 +809,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _resetSilenceWatchdog() {
     _silenceCheckTimer?.cancel();
-    if (!_callModeActive || _isProcessing || _isCallModeAsleep) return;
+    if (!_callModeActive || _isProcessing || _isCallModeAsleep || _isTtsWorkerRunning) return;
 
-    // 10 Seconds of silence -> Ask user
     _silenceCheckTimer = Timer(const Duration(seconds: 10), () async {
-      if (!_callModeActive || _isProcessing || _isCallModeAsleep) return;
+      if (!_callModeActive || _isProcessing || _isCallModeAsleep || _isTtsWorkerRunning) return;
 
       await _tts.speak("Are you still there?");
 
-      // Another 10 seconds of silence -> Enter sleep mode
       _silenceCheckTimer = Timer(const Duration(seconds: 10), () {
-        if (!_callModeActive || _isProcessing || _isCallModeAsleep) return;
+        if (!_callModeActive || _isProcessing || _isCallModeAsleep || _isTtsWorkerRunning) return;
         setState(() => _isCallModeAsleep = true);
         _tts.speak("Standby. Say ${_wakeWord} to wake me.");
       });
@@ -931,7 +945,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await _stopTts();
     _ttsStreamBuffer = "";
 
-    // Audible processing chime
     _playNativeTone("processing");
 
     final outgoingAttachments = List<AttachmentItem>.from(_selectedAttachments);
@@ -1005,7 +1018,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           streamBuffer.write(token);
           final currentText = streamBuffer.toString();
 
-          // Update UI safely without blocking background thread
           if (mounted) {
             setState(() {
               final idx = _currentSession.messages.indexWhere((m) => m.id == assistantMsgId);
@@ -1258,7 +1270,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _scrollToBottom() {
-    // Only animate scroll when app is in foreground and has clients
     if (!mounted || !_scrollController.hasClients) return;
 
     _scrollController.animateTo(
@@ -1301,7 +1312,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ),
         actions: [
-          // Call-Mode Toggle
           IconButton(
             tooltip: _callModeActive ? "Call Mode: Active" : "Call Mode: Disconnected",
             icon: Icon(
