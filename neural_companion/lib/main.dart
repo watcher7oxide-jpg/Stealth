@@ -169,15 +169,54 @@ class ChatMessage {
       );
 }
 
+class ChatSession {
+  final String id;
+  String title;
+  final DateTime createdAt;
+  DateTime lastModified;
+  List<ChatMessage> messages;
+
+  ChatSession({
+    required this.id,
+    required this.title,
+    required this.createdAt,
+    required this.lastModified,
+    List<ChatMessage>? messages,
+  }) : messages = messages ?? [];
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'createdAt': createdAt.toIso8601String(),
+        'lastModified': lastModified.toIso8601String(),
+        'messages': messages.map((m) => m.toJson()).toList(),
+      };
+
+  factory ChatSession.fromJson(Map<String, dynamic> json) => ChatSession(
+        id: json['id'] ?? '',
+        title: json['title'] ?? 'New Chat',
+        createdAt: DateTime.tryParse(json['createdAt'] ?? '') ?? DateTime.now(),
+        lastModified:
+            DateTime.tryParse(json['lastModified'] ?? '') ?? DateTime.now(),
+        messages: (json['messages'] as List<dynamic>? ?? [])
+            .map((m) => ChatMessage.fromJson(m as Map<String, dynamic>))
+            .toList(),
+      );
+}
+
 class LearnedMemoryFact {
   final String id;
   final String fact;
-  final String category;
+  final String reasoning;
+  final String importance; // High, Medium, Context
+  final String category;   // Identity, Preference, Directive, Discussion
   final DateTime learnedAt;
 
   LearnedMemoryFact({
     required this.id,
     required this.fact,
+    required this.reasoning,
+    required this.importance,
     required this.category,
     required this.learnedAt,
   });
@@ -185,6 +224,8 @@ class LearnedMemoryFact {
   Map<String, dynamic> toJson() => {
         'id': id,
         'fact': fact,
+        'reasoning': reasoning,
+        'importance': importance,
         'category': category,
         'learnedAt': learnedAt.toIso8601String(),
       };
@@ -193,18 +234,20 @@ class LearnedMemoryFact {
       LearnedMemoryFact(
         id: json['id'] ?? '',
         fact: json['fact'] ?? '',
-        category: json['category'] ?? 'general',
+        reasoning: json['reasoning'] ?? 'Extracted from conversation turn',
+        importance: json['importance'] ?? 'Medium',
+        category: json['category'] ?? 'General',
         learnedAt:
             DateTime.tryParse(json['learnedAt'] ?? '') ?? DateTime.now(),
       );
 }
 
 class CognitiveMemoryBank {
-  String personaOverview = "Helpful personal companion.";
+  String personaOverview = "Autonomous, ultra-fast personal assistant.";
   List<LearnedMemoryFact> facts = [];
 
   Map<String, dynamic> toJson() => {
-        'format': 'NeuralMemory_v2',
+        'format': 'NeuralMemory_v3',
         'exportDate': DateTime.now().toIso8601String(),
         'personaOverview': personaOverview,
         'facts': facts.map((f) => f.toJson()).toList(),
@@ -219,12 +262,22 @@ class CognitiveMemoryBank {
     }
   }
 
+  /// Compact system context: feeds highest-priority facts first
   String buildSystemContext() {
     final buffer = StringBuffer();
     buffer.write("You are an intelligent, concise personal AI. Answer questions directly without repeating phrases. ");
+
     if (facts.isNotEmpty) {
-      buffer.write("Facts about user: ");
-      for (final f in facts.take(6)) {
+      buffer.write("Important facts to remember: ");
+      // Prioritize High importance facts (Identity, Preferences, Directives)
+      final prioritized = List<LearnedMemoryFact>.from(facts)
+        ..sort((a, b) {
+          if (a.importance == "High" && b.importance != "High") return -1;
+          if (a.importance != "High" && b.importance == "High") return 1;
+          return b.learnedAt.compareTo(a.learnedAt);
+        });
+
+      for (final f in prioritized.take(7)) {
         buffer.write("[${f.fact}] ");
       }
     }
@@ -271,21 +324,25 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
-  final List<ChatMessage> _messages = [];
+  // Multi-Session Chat State
+  final List<ChatSession> _sessions = [];
+  String? _currentSessionId;
   final List<AttachmentItem> _selectedAttachments = [];
 
+  // Memory & Engine State
   final CognitiveMemoryBank _memoryBank = CognitiveMemoryBank();
   final LlamaController _llama = LlamaController();
 
-  // Voice & TTS State
+  // Voice & Audio State
   final stt.SpeechToText _speech = stt.SpeechToText();
   final FlutterTts _tts = FlutterTts();
   bool _speechEnabled = false;
   bool _isListening = false;
   bool _voiceResponseEnabled = false;
 
-  // Active audio player state
+  // Active audio player tracker
   String? _currentlySpeakingMessageId;
   final List<String> _ttsQueue = [];
   bool _isTtsProcessingQueue = false;
@@ -299,6 +356,24 @@ class _ChatScreenState extends State<ChatScreen> {
 
   static const MethodChannel _pickerChannel =
       MethodChannel('com.example.neural_companion/file_picker');
+
+  ChatSession get _currentSession {
+    if (_sessions.isEmpty) {
+      final newSession = ChatSession(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        title: "New Conversation",
+        createdAt: DateTime.now(),
+        lastModified: DateTime.now(),
+      );
+      _sessions.add(newSession);
+      _currentSessionId = newSession.id;
+      return newSession;
+    }
+    return _sessions.firstWhere(
+      (s) => s.id == _currentSessionId,
+      orElse: () => _sessions.first,
+    );
+  }
 
   @override
   void initState() {
@@ -320,37 +395,43 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
-  /* ---------------- PERSISTENT CHAT & MEMORY STORAGE ---------------- */
+  /* ---------------- MULTI-SESSION PERSISTENCE ---------------- */
 
-  Future<File> _getChatHistoryFile() async {
+  Future<File> _getSessionsFile() async {
     final dir = await getApplicationDocumentsDirectory();
-    return File('${dir.path}/chat_history_v2.json');
+    return File('${dir.path}/chat_sessions_v3.json');
   }
 
-  Future<void> _saveChatHistoryToDisk() async {
+  Future<void> _saveSessionsToDisk() async {
     try {
-      final file = await _getChatHistoryFile();
+      final file = await _getSessionsFile();
       final List<Map<String, dynamic>> jsonList =
-          _messages.map((m) => m.toJson()).toList();
+          _sessions.map((s) => s.toJson()).toList();
       await file.writeAsString(jsonEncode(jsonList));
     } catch (_) {}
   }
 
-  Future<void> _loadChatHistoryFromDisk() async {
+  Future<void> _loadSessionsFromDisk() async {
     try {
-      final file = await _getChatHistoryFile();
+      final file = await _getSessionsFile();
       if (await file.exists()) {
         final content = await file.readAsString();
         final List<dynamic> jsonList = jsonDecode(content);
         setState(() {
-          _messages.clear();
+          _sessions.clear();
           for (final item in jsonList) {
-            _messages.add(ChatMessage.fromJson(item as Map<String, dynamic>));
+            _sessions.add(ChatSession.fromJson(item as Map<String, dynamic>));
+          }
+          if (_sessions.isNotEmpty) {
+            _currentSessionId = _sessions.first.id;
           }
         });
-        _scrollToBottom();
       }
     } catch (_) {}
+
+    if (_sessions.isEmpty) {
+      _createNewSession(showSnackbar: false);
+    }
   }
 
   Future<File> _getLocalMemoryFile() async {
@@ -385,7 +466,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _bindModel(savedPath);
     }
     await _loadMemoryFromDisk();
-    await _loadChatHistoryFromDisk();
+    await _loadSessionsFromDisk();
   }
 
   Future<void> _checkPreviousNativeCrash() async {
@@ -406,6 +487,63 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } catch (_) {}
   }
+
+  /* ---------------- SESSION MANAGEMENT ---------------- */
+
+  Future<void> _createNewSession({bool showSnackbar = true}) async {
+    await _stopGeneration();
+
+    final newSession = ChatSession(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      title: "Conversation ${_sessions.length + 1}",
+      createdAt: DateTime.now(),
+      lastModified: DateTime.now(),
+    );
+
+    setState(() {
+      _sessions.insert(0, newSession);
+      _currentSessionId = newSession.id;
+    });
+
+    await _saveSessionsToDisk();
+
+    if (showSnackbar && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Started a new chat session"), duration: Duration(seconds: 1)),
+      );
+    }
+  }
+
+  Future<void> _switchSession(String sessionId) async {
+    if (_currentSessionId == sessionId) return;
+
+    await _stopGeneration();
+
+    setState(() {
+      _currentSessionId = sessionId;
+    });
+
+    _scrollToBottom();
+  }
+
+  Future<void> _deleteSession(String sessionId) async {
+    await _stopGeneration();
+
+    setState(() {
+      _sessions.removeWhere((s) => s.id == sessionId);
+      if (_currentSessionId == sessionId) {
+        _currentSessionId = _sessions.isNotEmpty ? _sessions.first.id : null;
+      }
+    });
+
+    if (_sessions.isEmpty) {
+      _createNewSession(showSnackbar: false);
+    }
+
+    await _saveSessionsToDisk();
+  }
+
+  /* ---------------- AUDIO & SPEECH HANDLERS ---------------- */
 
   Future<void> _initSpeechEngine() async {
     try {
@@ -434,14 +572,14 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     _tts.setErrorHandler((_) {
-      setState(() {
-        _isTtsProcessingQueue = false;
-        _currentlySpeakingMessageId = null;
-      });
+      if (mounted) {
+        setState(() {
+          _isTtsProcessingQueue = false;
+          _currentlySpeakingMessageId = null;
+        });
+      }
     });
   }
-
-  /* ---------------- ROBUST AUDIO TTS CONTROLLER ---------------- */
 
   void _enqueueTtsText(String sentence, {String? messageId}) {
     final clean = sentence.trim();
@@ -479,13 +617,10 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /// Plays or halts speech for a single specific message
   Future<void> _toggleMessageSpeech(ChatMessage msg) async {
     if (_currentlySpeakingMessageId == msg.id) {
-      // Tapping the playing message stops it immediately
       await _stopTts();
     } else {
-      // Tapping a different message stops the previous one and starts the new one
       await _stopTts();
       setState(() => _currentlySpeakingMessageId = msg.id);
 
@@ -504,7 +639,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /* ---------------- GGUF SELECTION & LOADING ---------------- */
+  /* ---------------- GGUF BINDER ---------------- */
 
   Future<void> _selectGgufModel() async {
     if (kIsWeb) {
@@ -580,7 +715,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /* ---------------- INFERENCE ENGINE & ANTI-HALLUCINATION FIX ---------------- */
+  /* ---------------- INFERENCE & CANCELLATION ---------------- */
 
   Future<void> _stopGeneration() async {
     if (_activeInferenceSubscription != null) {
@@ -588,25 +723,26 @@ class _ChatScreenState extends State<ChatScreen> {
       _activeInferenceSubscription = null;
     }
 
-    // Force C++ native thread stop
     try {
       await _llama.stop();
     } catch (_) {}
 
     await _stopTts();
 
-    setState(() {
-      _isProcessing = false;
-      if (_messages.isNotEmpty && !_messages.last.isUser && _messages.last.text.isEmpty) {
-        _messages.last = _messages.last.copyWith(text: "(Stopped)");
-      }
-    });
-
-    await _saveChatHistoryToDisk();
+    if (_isProcessing) {
+      setState(() {
+        _isProcessing = false;
+        final currentMessages = _currentSession.messages;
+        if (currentMessages.isNotEmpty && !currentMessages.last.isUser && currentMessages.last.text.isEmpty) {
+          currentMessages.last = currentMessages.last.copyWith(text: "(Stopped)");
+        }
+      });
+      await _saveSessionsToDisk();
+    }
   }
 
   Future<void> _handleSendMessage() async {
-    if (_isProcessing) return; // Prevent prompt collision
+    if (_isProcessing) return;
 
     final text = _textController.text.trim();
     if (text.isEmpty && _selectedAttachments.isEmpty) return;
@@ -628,10 +764,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final outgoingAttachments = List<AttachmentItem>.from(_selectedAttachments);
 
-    // 1. Build prompt strictly before adding to state (no duplicate turns)
+    // 1. Build prompt context BEFORE mutating state
     final prompt = _buildCleanContextPrompt(text, outgoingAttachments);
 
-    // 2. Add Messages to UI
+    // 2. Add Messages to the current session
     final userMsg = ChatMessage(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       text: text,
@@ -650,17 +786,25 @@ class _ChatScreenState extends State<ChatScreen> {
     );
 
     setState(() {
-      _messages.add(userMsg);
-      _messages.add(assistantMsg);
+      _currentSession.messages.add(userMsg);
+      _currentSession.messages.add(assistantMsg);
+      _currentSession.lastModified = DateTime.now();
+
+      // Auto-name conversation title if still default
+      if (_currentSession.title.startsWith("Conversation") ||
+          _currentSession.title == "New Conversation") {
+        _currentSession.title = text.length > 24 ? "${text.substring(0, 24)}..." : text;
+      }
+
       _textController.clear();
       _selectedAttachments.clear();
       _isProcessing = true;
     });
 
     _scrollToBottom();
-    await _saveChatHistoryToDisk();
+    await _saveSessionsToDisk();
 
-    // 3. Wipe dirty KV cache from previous prompt (PREVENTS COLLISION & DRUNKARD LOOPS)
+    // 3. Clear KV cache to prevent token collision / loops
     try {
       await _llama.clearContext();
     } catch (_) {}
@@ -669,18 +813,16 @@ class _ChatScreenState extends State<ChatScreen> {
     final completer = Completer<void>();
 
     try {
-      // 4. Generate with repetition penalties
       final stream = _llama.generate(
         prompt: prompt,
         temperature: 0.6,
-        maxTokens: 300,
-        repeatPenalty: 1.18, // Forbids infinite repetition of "Tot Tot" or "()"
-        repeatLastN: 64
+        maxTokens: 320,
+        repeatPenalty: 1.18,
+        repeatLastN: 64,
       );
 
       _activeInferenceSubscription = stream.listen(
         (token) {
-          // Immediately kill stream if stop token arrives
           if (token.contains("<|im_end|>") ||
               token.contains("<|endoftext|>") ||
               token.contains("<|im_start|>") ||
@@ -696,16 +838,16 @@ class _ChatScreenState extends State<ChatScreen> {
           streamBuffer.write(token);
           final currentText = streamBuffer.toString();
 
-          // Live screen update
           setState(() {
-            final idx = _messages.indexWhere((m) => m.id == assistantMsgId);
+            final idx = _currentSession.messages.indexWhere((m) => m.id == assistantMsgId);
             if (idx != -1) {
-              _messages[idx] = _messages[idx].copyWith(text: currentText);
+              _currentSession.messages[idx] =
+                  _currentSession.messages[idx].copyWith(text: currentText);
             }
           });
           _scrollToBottom();
 
-          // Sentence-by-sentence streaming speech
+          // Sentence-by-sentence TTS
           if (_voiceResponseEnabled) {
             _ttsStreamBuffer += token;
             if (_ttsStreamBuffer.contains('.') ||
@@ -745,7 +887,6 @@ class _ChatScreenState extends State<ChatScreen> {
         },
       );
 
-      // Speak any remaining sentence tail
       if (_voiceResponseEnabled && _ttsStreamBuffer.trim().isNotEmpty) {
         _enqueueTtsText(_ttsStreamBuffer.trim(), messageId: assistantMsgId);
       }
@@ -753,9 +894,9 @@ class _ChatScreenState extends State<ChatScreen> {
       final finalReply = streamBuffer.toString().trim();
 
       setState(() {
-        final idx = _messages.indexWhere((m) => m.id == assistantMsgId);
+        final idx = _currentSession.messages.indexWhere((m) => m.id == assistantMsgId);
         if (idx != -1) {
-          _messages[idx] = _messages[idx].copyWith(
+          _currentSession.messages[idx] = _currentSession.messages[idx].copyWith(
             text: finalReply.isNotEmpty ? finalReply : "(No response generated)",
           );
         }
@@ -763,29 +904,29 @@ class _ChatScreenState extends State<ChatScreen> {
       });
 
       _scrollToBottom();
-      await _saveChatHistoryToDisk();
+      await _saveSessionsToDisk();
 
-      _autoExtractMemory(text, finalReply);
+      // Distill turn into the Cognitive Memory Bank with explicit reasoning
+      _distillAndStoreMemory(text, finalReply);
     } catch (e, stack) {
       setState(() => _isProcessing = false);
       _showGlobalErrorDialog("Inference Error", e.toString(), stack.toString());
     }
   }
 
-  /// Compact ChatML prompt builder avoiding duplicate history
   String _buildCleanContextPrompt(String currentInput, List<AttachmentItem> attachments) {
     final buffer = StringBuffer();
 
-    // 1. System Prompt
+    // 1. System Prompt with High/Medium facts
     buffer.writeln("<|im_start|>system");
     buffer.writeln(_memoryBank.buildSystemContext());
     buffer.writeln("<|im_end|>");
 
-    // 2. Last 1 turn of history (2 messages max) to keep context pure for SmolLM2
-    final existingMessages = _messages.where((m) => m.text.isNotEmpty).toList();
-    final slice = existingMessages.length > 2
-        ? existingMessages.sublist(existingMessages.length - 2)
-        : existingMessages;
+    // 2. Rolling history from the CURRENT active session (last 2 full turns MAX)
+    final existing = _currentSession.messages.where((m) => m.text.isNotEmpty).toList();
+    final slice = existing.length > 2
+        ? existing.sublist(existing.length - 2)
+        : existing;
 
     for (final m in slice) {
       if (m.isUser) {
@@ -819,43 +960,99 @@ class _ChatScreenState extends State<ChatScreen> {
     return buffer.toString();
   }
 
-  /* ---------------- CONTINUOUS DISCUSSION ARCHIVAL ---------------- */
+  /* ---------------- COGNITIVE REASONING & MEMORY EXTRACTION ---------------- */
 
-  void _autoExtractMemory(String userText, String assistantReply) {
+  void _distillAndStoreMemory(String prompt, String reply) {
     unawaited(() async {
-      final cleanInput = userText.trim();
-      if (cleanInput.length < 4) return;
+      final cleanPrompt = prompt.trim();
+      final cleanReply = reply.trim();
+      if (cleanPrompt.length < 3) return;
 
-      final lower = cleanInput.toLowerCase();
+      final lower = cleanPrompt.toLowerCase();
+      String category = "Discussion";
+      String importance = "Medium";
+      String reasoning = "General knowledge and context from conversation turn.";
+      String distilledFact = cleanPrompt;
 
-      final bool isFact = lower.contains("my name is") ||
-          lower.contains("i am") ||
-          lower.contains("i'm") ||
-          lower.contains("remember") ||
-          lower.contains("prefer") ||
-          lower.contains("i live") ||
-          lower.contains("i work");
-
-      if (isFact) {
-        final existing = _memoryBank.facts.any(
-          (f) => f.fact.toLowerCase() == cleanInput.toLowerCase(),
-        );
-
-        if (!existing) {
-          _memoryBank.facts.insert(
-            0,
-            LearnedMemoryFact(
-              id: DateTime.now().millisecondsSinceEpoch.toString(),
-              fact: cleanInput,
-              category: 'identity',
-              learnedAt: DateTime.now(),
-            ),
-          );
-        }
+      // 1. Identity Detection (Highest Priority)
+      if (lower.contains("my name is") ||
+          lower.contains("call me") ||
+          lower.startsWith("i am ") ||
+          lower.startsWith("i'm ") ||
+          lower.contains("i live in") ||
+          lower.contains("i work as")) {
+        category = "Identity";
+        importance = "High";
+        reasoning = "Core user identity and biographical declaration.";
+        distilledFact = cleanPrompt;
+      }
+      // 2. Preference Detection (High Priority)
+      else if (lower.contains("i like") ||
+          lower.contains("i love") ||
+          lower.contains("i prefer") ||
+          lower.contains("i hate") ||
+          lower.contains("i dislike") ||
+          lower.contains("my favorite")) {
+        category = "Preference";
+        importance = "High";
+        reasoning = "User expression of preference to tailor future assistance.";
+        distilledFact = cleanPrompt;
+      }
+      // 3. Directives & Instructions (High Priority)
+      else if (lower.contains("remember") ||
+          lower.contains("don't forget") ||
+          lower.contains("always") ||
+          lower.contains("never")) {
+        category = "Directive";
+        importance = "High";
+        reasoning = "Explicit instruction by user for permanent retention.";
+        distilledFact = cleanPrompt;
+      }
+      // 4. General Topical Discussion (Medium Priority)
+      else if (cleanPrompt.length >= 10 && cleanReply.length >= 10) {
+        category = "Discussion";
+        importance = "Medium";
+        reasoning = "Key exchange regarding topic and context.";
+        final shortReply = cleanReply.length > 70 ? "${cleanReply.substring(0, 70)}..." : cleanReply;
+        distilledFact = "User asked: \"$cleanPrompt\" | Summary: $shortReply";
+      } else {
+        // Skip short noise like "ok", "cool", "thanks"
+        return;
       }
 
-      if (_memoryBank.facts.length > 50) {
-        _memoryBank.facts = _memoryBank.facts.sublist(0, 50);
+      // Check for duplicate fact
+      final existingIndex = _memoryBank.facts.indexWhere(
+        (f) => f.fact.toLowerCase() == distilledFact.toLowerCase(),
+      );
+
+      if (existingIndex != -1) {
+        // Update timestamp of existing fact
+        _memoryBank.facts[existingIndex] = LearnedMemoryFact(
+          id: _memoryBank.facts[existingIndex].id,
+          fact: distilledFact,
+          reasoning: reasoning,
+          importance: importance,
+          category: category,
+          learnedAt: DateTime.now(),
+        );
+      } else {
+        // Insert new evaluated fact at top
+        _memoryBank.facts.insert(
+          0,
+          LearnedMemoryFact(
+            id: DateTime.now().millisecondsSinceEpoch.toString(),
+            fact: distilledFact,
+            reasoning: reasoning,
+            importance: importance,
+            category: category,
+            learnedAt: DateTime.now(),
+          ),
+        );
+      }
+
+      // Keep maximum 80 evaluated facts
+      if (_memoryBank.facts.length > 80) {
+        _memoryBank.facts = _memoryBank.facts.sublist(0, 80);
       }
 
       await _saveMemoryToDisk();
@@ -876,7 +1073,7 @@ class _ChatScreenState extends State<ChatScreen> {
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1E2230),
         title: const Text("Clear All Memories?"),
-        content: const Text("This will permanently remove all stored facts from the cognitive bank."),
+        content: const Text("This will permanently wipe all evaluated facts and reasoning from the memory bank."),
         actions: [
           TextButton(
             child: const Text("Cancel"),
@@ -904,36 +1101,6 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _clearChatHistory() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF1E2230),
-        title: const Text("Clear Chat?"),
-        content: const Text("This resets the screen without erasing facts in the Memory Bank."),
-        actions: [
-          TextButton(
-            child: const Text("Cancel"),
-            onPressed: () => Navigator.pop(ctx, false),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
-            child: const Text("Clear"),
-            onPressed: () => Navigator.pop(ctx, true),
-          ),
-        ],
-      ),
-    );
-
-    if (confirm == true) {
-      await _stopTts();
-      setState(() {
-        _messages.clear();
-      });
-      await _saveChatHistoryToDisk();
-    }
-  }
-
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
@@ -950,15 +1117,26 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final currentMessages = _currentSession.messages;
+
     return Scaffold(
+      key: _scaffoldKey,
+      drawer: _buildSessionsDrawer(),
       appBar: AppBar(
         backgroundColor: const Color(0xFF141721),
+        leading: IconButton(
+          tooltip: "Chat History",
+          icon: const Icon(Icons.forum_outlined, color: Colors.white70),
+          onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+        ),
         title: GestureDetector(
           onTap: _isProcessing ? null : _selectGgufModel,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text("Neural Companion", style: TextStyle(fontSize: 16)),
+              Text(_currentSession.title,
+                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+                  overflow: TextOverflow.ellipsis),
               Text(
                 _modelStatus,
                 style: const TextStyle(fontSize: 10, color: Color(0xFF00D2FF)),
@@ -969,14 +1147,9 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         actions: [
           IconButton(
-            tooltip: "System Logs",
-            icon: const Icon(Icons.terminal, color: Colors.amberAccent),
-            onPressed: _showDeviceLogcat,
-          ),
-          IconButton(
-            tooltip: "Clear Screen",
-            icon: const Icon(Icons.delete_sweep, color: Colors.white70),
-            onPressed: _clearChatHistory,
+            tooltip: "New Chat",
+            icon: const Icon(Icons.add_comment_outlined, color: Color(0xFF00D2FF)),
+            onPressed: () => _createNewSession(),
           ),
           IconButton(
             tooltip: _voiceResponseEnabled ? "TTS Auto: On" : "TTS Auto: Off",
@@ -991,15 +1164,25 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           IconButton(
             tooltip: "Memory Bank",
-            icon: const Icon(Icons.psychology, color: Color(0xFF6C63FF)),
+            icon: Badge(
+              isLabelVisible: _memoryBank.facts.isNotEmpty,
+              label: Text(_memoryBank.facts.length.toString()),
+              backgroundColor: const Color(0xFF6C63FF),
+              child: const Icon(Icons.psychology, color: Color(0xFF6C63FF)),
+            ),
             onPressed: _showMemoryModal,
+          ),
+          IconButton(
+            tooltip: "Logs",
+            icon: const Icon(Icons.terminal, color: Colors.amberAccent, size: 20),
+            onPressed: _showDeviceLogcat,
           ),
         ],
       ),
       body: Column(
         children: [
           Expanded(
-            child: _messages.isEmpty
+            child: currentMessages.isEmpty
                 ? Center(
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
@@ -1007,7 +1190,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         Icon(Icons.bolt, size: 48, color: Colors.white.withValues(alpha: 0.2)),
                         const SizedBox(height: 8),
                         Text(
-                          "SmolLM Engine Ready\nContext-Protected Memory Active",
+                          "${_currentSession.title}\nReady to chat",
                           textAlign: TextAlign.center,
                           style: TextStyle(color: Colors.white.withValues(alpha: 0.4), fontSize: 13),
                         ),
@@ -1017,9 +1200,9 @@ class _ChatScreenState extends State<ChatScreen> {
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    itemCount: _messages.length,
+                    itemCount: currentMessages.length,
                     itemBuilder: (context, i) {
-                      final m = _messages[i];
+                      final m = currentMessages[i];
                       return _buildMessageItem(m);
                     },
                   ),
@@ -1032,6 +1215,81 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           _buildInputBar(),
         ],
+      ),
+    );
+  }
+
+  Widget _buildSessionsDrawer() {
+    return Drawer(
+      backgroundColor: const Color(0xFF141721),
+      child: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    "Chat History",
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.add_box_rounded, color: Color(0xFF00D2FF)),
+                    onPressed: () {
+                      Navigator.pop(context);
+                      _createNewSession();
+                    },
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: Colors.white10),
+            Expanded(
+              child: ListView.separated(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                itemCount: _sessions.length,
+                separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white10),
+                itemBuilder: (context, i) {
+                  final s = _sessions[i];
+                  final isCurrent = s.id == _currentSessionId;
+
+                  return ListTile(
+                    dense: true,
+                    selected: isCurrent,
+                    selectedTileColor: const Color(0xFF1E2230),
+                    leading: Icon(
+                      Icons.chat_bubble_outline,
+                      size: 18,
+                      color: isCurrent ? const Color(0xFF00D2FF) : Colors.white38,
+                    ),
+                    title: Text(
+                      s.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: isCurrent ? Colors.white : Colors.white70,
+                        fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
+                    subtitle: Text(
+                      "${s.messages.length} messages • ${s.lastModified.hour}:${s.lastModified.minute.toString().padLeft(2, '0')}",
+                      style: const TextStyle(fontSize: 10, color: Colors.white38),
+                    ),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.delete_outline, size: 16, color: Colors.white38),
+                      onPressed: () => _deleteSession(s.id),
+                    ),
+                    onTap: () {
+                      Navigator.pop(context);
+                      _switchSession(s.id);
+                    },
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1061,14 +1319,12 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: const TextStyle(fontSize: 14, color: Colors.white, height: 1.35),
               ),
             ),
-            // Per-Response Action Bar (Speaker & Copy)
             if (!m.isUser && m.text.isNotEmpty && m.text != "...")
               Padding(
                 padding: const EdgeInsets.only(top: 2, left: 4),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    // Speaker / Stop Toggle
                     InkWell(
                       borderRadius: BorderRadius.circular(16),
                       onTap: () => _toggleMessageSpeech(m),
@@ -1082,7 +1338,6 @@ class _ChatScreenState extends State<ChatScreen> {
                       ),
                     ),
                     const SizedBox(width: 8),
-                    // Copy Button
                     InkWell(
                       borderRadius: BorderRadius.circular(16),
                       onTap: () {
@@ -1174,7 +1429,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: const TextStyle(color: Colors.white),
                 decoration: InputDecoration(
                   hintText: _isProcessing
-                      ? "Generating..."
+                      ? "Assistant is responding..."
                       : _isListening
                           ? "Listening..."
                           : "Message companion...",
@@ -1190,7 +1445,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 onSubmitted: (_) => _handleSendMessage(),
               ),
             ),
-            // Dynamic Stop / Send Button
             IconButton(
               icon: Icon(
                 _isProcessing ? Icons.stop_circle : Icons.send,
@@ -1205,7 +1459,7 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  /* ---------------- MEMORY BANK MODAL (EDIT & DELETE) ---------------- */
+  /* ---------------- COGNITIVE MEMORY MODAL WITH REASONING ---------------- */
 
   void _showMemoryModal() {
     showModalBottomSheet(
@@ -1216,7 +1470,7 @@ class _ChatScreenState extends State<ChatScreen> {
         return StatefulBuilder(
           builder: (context, setModalState) {
             return FractionallySizedBox(
-              heightFactor: 0.75,
+              heightFactor: 0.8,
               child: Padding(
                 padding: const EdgeInsets.all(16),
                 child: Column(
@@ -1287,33 +1541,66 @@ class _ChatScreenState extends State<ChatScreen> {
                       child: _memoryBank.facts.isEmpty
                           ? const Center(
                               child: Text(
-                                "No memories stored yet.\nTalk with the model to automatically accumulate knowledge.",
+                                "No memories distilled yet.\nSend prompts to automatically extract evaluated knowledge.",
                                 textAlign: TextAlign.center,
                                 style: TextStyle(color: Colors.white38, fontSize: 13),
                               ),
                             )
                           : ListView.separated(
                               itemCount: _memoryBank.facts.length,
-                              separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white10),
+                              separatorBuilder: (_, __) =>
+                                  const Divider(height: 1, color: Colors.white10),
                               itemBuilder: (_, i) {
                                 final item = _memoryBank.facts[i];
-                                return ListTile(
-                                  dense: true,
-                                  contentPadding: EdgeInsets.zero,
-                                  title: Text(
-                                    item.fact,
-                                    style: const TextStyle(fontSize: 13, color: Colors.white),
-                                  ),
-                                  subtitle: Text(
-                                    "${item.category} • ${item.learnedAt.hour}:${item.learnedAt.minute.toString().padLeft(2, '0')}",
-                                    style: const TextStyle(fontSize: 10, color: Colors.white38),
-                                  ),
-                                  trailing: IconButton(
-                                    icon: const Icon(Icons.close, size: 16, color: Colors.redAccent),
-                                    onPressed: () {
-                                      _deleteMemory(i);
-                                      setModalState(() {});
-                                    },
+                                final isHigh = item.importance == "High";
+
+                                return Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 6.0),
+                                  child: Row(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                        decoration: BoxDecoration(
+                                          color: isHigh
+                                              ? Colors.amberAccent.withValues(alpha: 0.2)
+                                              : Colors.blueAccent.withValues(alpha: 0.2),
+                                          borderRadius: BorderRadius.circular(4),
+                                        ),
+                                        child: Text(
+                                          item.category,
+                                          style: TextStyle(
+                                            fontSize: 10,
+                                            fontWeight: FontWeight.bold,
+                                            color: isHigh ? Colors.amberAccent : Colors.lightBlueAccent,
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              item.fact,
+                                              style: const TextStyle(fontSize: 13, color: Colors.white),
+                                            ),
+                                            const SizedBox(height: 2),
+                                            Text(
+                                              "Reasoning: ${item.reasoning}",
+                                              style: const TextStyle(fontSize: 11, color: Colors.white54, fontStyle: FontStyle.italic),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      IconButton(
+                                        icon: const Icon(Icons.close, size: 16, color: Colors.redAccent),
+                                        onPressed: () {
+                                          _deleteMemory(i);
+                                          setModalState(() {});
+                                        },
+                                      ),
+                                    ],
                                   ),
                                 );
                               },
