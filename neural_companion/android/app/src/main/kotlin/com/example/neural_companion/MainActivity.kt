@@ -16,6 +16,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.OpenableColumns
+import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -47,8 +48,8 @@ class CallService : Service() {
         }
 
         val notification: Notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Neural Companion: Call Active")
-            .setContentText("Listening and responding in background...")
+            .setContentTitle("Neural Companion Active")
+            .setContentText("Continuous call mode connected...")
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -79,9 +80,11 @@ class MainActivity: FlutterActivity() {
     private val PICK_GGUF_REQUEST_CODE = 9912
     private var pendingResult: MethodChannel.Result? = null
     private var toneGenerator: ToneGenerator? = null
+    private var audioManager: AudioManager? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -113,18 +116,9 @@ class MainActivity: FlutterActivity() {
                     }
                     startActivityForResult(intent, PICK_GGUF_REQUEST_CODE)
                 }
-                "setCallService" -> {
+                "setCallModeHardware" -> {
                     val enable = call.argument<Boolean>("enable") ?: false
-                    val serviceIntent = Intent(this, CallService::class.java)
-                    if (enable) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            startForegroundService(serviceIntent)
-                        } else {
-                            startService(serviceIntent)
-                        }
-                    } else {
-                        stopService(serviceIntent)
-                    }
+                    setCallModeHardware(enable)
                     result.success(true)
                 }
                 "playTone" -> {
@@ -137,10 +131,36 @@ class MainActivity: FlutterActivity() {
         }
     }
 
+    private fun setCallModeHardware(enable: Boolean) {
+        runOnUiThread {
+            if (enable) {
+                // 1. Keep window active to prevent Google STT shutdown
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+                // 2. Hardware Acoustic Echo Cancellation (AEC)
+                audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+                audioManager?.isSpeakerphoneOn = true
+
+                // 3. Start Foreground Service
+                val serviceIntent = Intent(this, CallService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent)
+                } else {
+                    startService(serviceIntent)
+                }
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                audioManager?.mode = AudioManager.MODE_NORMAL
+                val serviceIntent = Intent(this, CallService::class.java)
+                stopService(serviceIntent)
+            }
+        }
+    }
+
     private fun playTone(type: String) {
         try {
             if (toneGenerator == null) {
-                toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 85)
+                toneGenerator = ToneGenerator(AudioManager.STREAM_VOICE_CALL, 90)
             }
             when (type) {
                 "processing" -> toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP2, 100)
@@ -216,8 +236,7 @@ class MainActivity: FlutterActivity() {
     }
 
     override fun onDestroy() {
-        val serviceIntent = Intent(this, CallService::class.java)
-        stopService(serviceIntent)
+        setCallModeHardware(false)
         toneGenerator?.release()
         toneGenerator = null
         super.onDestroy()
