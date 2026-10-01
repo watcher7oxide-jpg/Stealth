@@ -1,25 +1,88 @@
 package com.example.neural_companion
 
 import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
+import android.os.PowerManager
 import android.provider.OpenableColumns
+import androidx.core.app.NotificationCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileOutputStream
 
+class CallService : Service() {
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "NeuralCompanion:CallServiceLock")
+        wakeLock?.acquire(60 * 60 * 1000L)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val channelId = "neural_companion_call"
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Active Companion Call",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            manager.createNotificationChannel(channel)
+        }
+
+        val notification: Notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Neural Companion: Call Active")
+            .setContentText("Listening and responding in background...")
+            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        } else {
+            startForeground(1001, notification)
+        }
+
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        if (wakeLock?.isHeld == true) {
+            wakeLock?.release()
+        }
+        stopForeground(true)
+        super.onDestroy()
+    }
+}
+
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "com.example.neural_companion/file_picker"
     private val PICK_GGUF_REQUEST_CODE = 9912
     private var pendingResult: MethodChannel.Result? = null
+    private var toneGenerator: ToneGenerator? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Capture unhandled crashes to disk
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             try {
@@ -41,16 +104,51 @@ class MainActivity: FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
-            if (call.method == "pickGgufFile") {
-                pendingResult = result
-                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    type = "*/*"
+            when (call.method) {
+                "pickGgufFile" -> {
+                    pendingResult = result
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                    }
+                    startActivityForResult(intent, PICK_GGUF_REQUEST_CODE)
                 }
-                startActivityForResult(intent, PICK_GGUF_REQUEST_CODE)
-            } else {
-                result.notImplemented()
+                "setCallService" -> {
+                    val enable = call.argument<Boolean>("enable") ?: false
+                    val serviceIntent = Intent(this, CallService::class.java)
+                    if (enable) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(serviceIntent)
+                        } else {
+                            startService(serviceIntent)
+                        }
+                    } else {
+                        stopService(serviceIntent)
+                    }
+                    result.success(true)
+                }
+                "playTone" -> {
+                    val type = call.argument<String>("type") ?: "processing"
+                    playTone(type)
+                    result.success(true)
+                }
+                else -> result.notImplemented()
             }
+        }
+    }
+
+    private fun playTone(type: String) {
+        try {
+            if (toneGenerator == null) {
+                toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 85)
+            }
+            when (type) {
+                "processing" -> toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP2, 100)
+                "wake" -> toneGenerator?.startTone(ToneGenerator.TONE_PROP_ACK, 180)
+                "stop" -> toneGenerator?.startTone(ToneGenerator.TONE_PROP_NACK, 150)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
@@ -59,7 +157,6 @@ class MainActivity: FlutterActivity() {
         if (requestCode == PICK_GGUF_REQUEST_CODE) {
             if (resultCode == Activity.RESULT_OK && data?.data != null) {
                 val uri: Uri = data.data!!
-                // Offload to background thread
                 Thread {
                     try {
                         val path = resolveOrStreamFile(uri)
@@ -81,12 +178,7 @@ class MainActivity: FlutterActivity() {
         }
     }
 
-    /**
-     * Resolves direct POSIX storage paths or streams using an 8KB buffer.
-     * Never allocates large byte arrays in heap memory.
-     */
     private fun resolveOrStreamFile(uri: Uri): String {
-        // 1. Direct path check if on primary shared storage
         val docId = uri.path ?: ""
         if (docId.contains("primary:")) {
             val relativePath = docId.substringAfter("primary:")
@@ -96,7 +188,6 @@ class MainActivity: FlutterActivity() {
             }
         }
 
-        // 2. Query display name
         var fileName = "model.gguf"
         contentResolver.query(uri, null, null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) {
@@ -110,7 +201,6 @@ class MainActivity: FlutterActivity() {
             }
         }
 
-        // 3. Stream copy with an 8KB buffer (max memory consumption: 8KB)
         val targetFile = File(filesDir, fileName)
         contentResolver.openInputStream(uri)?.use { input ->
             FileOutputStream(targetFile).use { output ->
@@ -120,8 +210,16 @@ class MainActivity: FlutterActivity() {
                     output.write(buffer, 0, bytesRead)
                 }
             }
-        } ?: throw IllegalStateException("Failed to open input stream for $uri")
+        } ?: throw IllegalStateException("Failed to open stream for $uri")
 
         return targetFile.absolutePath
+    }
+
+    override fun onDestroy() {
+        val serviceIntent = Intent(this, CallService::class.java)
+        stopService(serviceIntent)
+        toneGenerator?.release()
+        toneGenerator = null
+        super.onDestroy()
     }
 }
