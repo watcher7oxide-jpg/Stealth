@@ -200,7 +200,7 @@ class LearnedMemoryFact {
 }
 
 class CognitiveMemoryBank {
-  String personaOverview = "Helpful, ultra-fast personal companion.";
+  String personaOverview = "Helpful personal companion.";
   List<LearnedMemoryFact> facts = [];
 
   Map<String, dynamic> toJson() => {
@@ -221,9 +221,9 @@ class CognitiveMemoryBank {
 
   String buildSystemContext() {
     final buffer = StringBuffer();
-    buffer.write("You are an intelligent, concise AI companion. Respond directly and accurately. ");
+    buffer.write("You are an intelligent, concise personal AI. Answer questions directly without repeating phrases. ");
     if (facts.isNotEmpty) {
-      buffer.write("Context: ");
+      buffer.write("Facts about user: ");
       for (final f in facts.take(6)) {
         buffer.write("[${f.fact}] ");
       }
@@ -285,13 +285,13 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isListening = false;
   bool _voiceResponseEnabled = false;
 
-  // Active audio tracker for individual messages
+  // Active audio player state
   String? _currentlySpeakingMessageId;
   final List<String> _ttsQueue = [];
   bool _isTtsProcessingQueue = false;
   String _ttsStreamBuffer = "";
 
-  // Inference & Stream Cancellation
+  // Inference state
   String? _loadedGgufPath;
   String _modelStatus = "No .gguf loaded";
   bool _isProcessing = false;
@@ -441,7 +441,7 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  /* ---------------- TTS STREAMING QUEUE HANDLER ---------------- */
+  /* ---------------- ROBUST AUDIO TTS CONTROLLER ---------------- */
 
   void _enqueueTtsText(String sentence, {String? messageId}) {
     final clean = sentence.trim();
@@ -469,21 +469,38 @@ class _ChatScreenState extends State<ChatScreen> {
     await _tts.speak(nextText);
   }
 
-  void _stopTts() async {
+  Future<void> _stopTts() async {
     _ttsQueue.clear();
     _isTtsProcessingQueue = false;
     _ttsStreamBuffer = "";
     await _tts.stop();
-    setState(() => _currentlySpeakingMessageId = null);
+    if (mounted) {
+      setState(() => _currentlySpeakingMessageId = null);
+    }
   }
 
-  void _toggleMessageSpeech(ChatMessage msg) async {
+  /// Plays or halts speech for a single specific message
+  Future<void> _toggleMessageSpeech(ChatMessage msg) async {
     if (_currentlySpeakingMessageId == msg.id) {
-      _stopTts();
+      // Tapping the playing message stops it immediately
+      await _stopTts();
     } else {
-      _stopTts();
+      // Tapping a different message stops the previous one and starts the new one
+      await _stopTts();
       setState(() => _currentlySpeakingMessageId = msg.id);
-      _enqueueTtsText(msg.text, messageId: msg.id);
+
+      final sentences = msg.text
+          .split(RegExp(r'(?<=[.?!])\s+|\n+'))
+          .where((s) => s.trim().isNotEmpty)
+          .toList();
+
+      if (sentences.isEmpty) {
+        setState(() => _currentlySpeakingMessageId = null);
+        return;
+      }
+
+      _ttsQueue.addAll(sentences);
+      _processNextTtsQueueItem();
     }
   }
 
@@ -563,28 +580,33 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /* ---------------- REAL-TIME INFERENCE & STOP BUTTON ---------------- */
+  /* ---------------- INFERENCE ENGINE & ANTI-HALLUCINATION FIX ---------------- */
 
-  void _stopGeneration() {
+  Future<void> _stopGeneration() async {
     if (_activeInferenceSubscription != null) {
-      _activeInferenceSubscription!.cancel();
+      await _activeInferenceSubscription!.cancel();
       _activeInferenceSubscription = null;
     }
 
-    _stopTts();
+    // Force C++ native thread stop
+    try {
+      await _llama.stop();
+    } catch (_) {}
+
+    await _stopTts();
 
     setState(() {
       _isProcessing = false;
       if (_messages.isNotEmpty && !_messages.last.isUser && _messages.last.text.isEmpty) {
-        _messages.last = _messages.last.copyWith(text: "(Cancelled)");
+        _messages.last = _messages.last.copyWith(text: "(Stopped)");
       }
     });
 
-    _saveChatHistoryToDisk();
+    await _saveChatHistoryToDisk();
   }
 
   Future<void> _handleSendMessage() async {
-    if (_isProcessing) return;
+    if (_isProcessing) return; // Prevent prompt collision
 
     final text = _textController.text.trim();
     if (text.isEmpty && _selectedAttachments.isEmpty) return;
@@ -601,15 +623,15 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
 
-    _stopTts();
+    await _stopTts();
     _ttsStreamBuffer = "";
 
     final outgoingAttachments = List<AttachmentItem>.from(_selectedAttachments);
 
-    // 1. Build context BEFORE mutating message state (prevents duplicate prompt bug)
+    // 1. Build prompt strictly before adding to state (no duplicate turns)
     final prompt = _buildCleanContextPrompt(text, outgoingAttachments);
 
-    // 2. Add User Message
+    // 2. Add Messages to UI
     final userMsg = ChatMessage(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       text: text,
@@ -618,7 +640,6 @@ class _ChatScreenState extends State<ChatScreen> {
       attachments: outgoingAttachments,
     );
 
-    // 3. Add placeholder Assistant Message for real-time streaming
     final String assistantMsgId =
         (DateTime.now().millisecondsSinceEpoch + 1).toString();
     final assistantMsg = ChatMessage(
@@ -639,19 +660,28 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToBottom();
     await _saveChatHistoryToDisk();
 
+    // 3. Wipe dirty KV cache from previous prompt (PREVENTS COLLISION & DRUNKARD LOOPS)
+    try {
+      await _llama.clearContext();
+    } catch (_) {}
+
     final StringBuffer streamBuffer = StringBuffer();
     final completer = Completer<void>();
 
     try {
+      // 4. Generate with repetition penalties
       final stream = _llama.generate(
         prompt: prompt,
         temperature: 0.6,
-        maxTokens: 350,
+        maxTokens: 300,
+        repeatPenalty: 1.18, // Forbids infinite repetition of "Tot Tot" or "()"
+        repeatLastN: 64,
+        penalizeNl: true,
       );
 
       _activeInferenceSubscription = stream.listen(
         (token) {
-          // Hard cancel on stop-sequence to completely prevent multi-turn drunkard hallucination
+          // Immediately kill stream if stop token arrives
           if (token.contains("<|im_end|>") ||
               token.contains("<|endoftext|>") ||
               token.contains("<|im_start|>") ||
@@ -659,6 +689,7 @@ class _ChatScreenState extends State<ChatScreen> {
               token.contains("\nUser")) {
             _activeInferenceSubscription?.cancel();
             _activeInferenceSubscription = null;
+            _llama.stop();
             if (!completer.isCompleted) completer.complete();
             return;
           }
@@ -675,7 +706,7 @@ class _ChatScreenState extends State<ChatScreen> {
           });
           _scrollToBottom();
 
-          // Live Sentence-by-Sentence TTS streaming
+          // Sentence-by-sentence streaming speech
           if (_voiceResponseEnabled) {
             _ttsStreamBuffer += token;
             if (_ttsStreamBuffer.contains('.') ||
@@ -711,10 +742,11 @@ class _ChatScreenState extends State<ChatScreen> {
         onTimeout: () {
           _activeInferenceSubscription?.cancel();
           _activeInferenceSubscription = null;
+          _llama.stop();
         },
       );
 
-      // Flush remaining speech buffer
+      // Speak any remaining sentence tail
       if (_voiceResponseEnabled && _ttsStreamBuffer.trim().isNotEmpty) {
         _enqueueTtsText(_ttsStreamBuffer.trim(), messageId: assistantMsgId);
       }
@@ -741,19 +773,19 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /// Builds a clean ChatML prompt avoiding duplicate turns and context overflow
+  /// Compact ChatML prompt builder avoiding duplicate history
   String _buildCleanContextPrompt(String currentInput, List<AttachmentItem> attachments) {
     final buffer = StringBuffer();
 
-    // 1. System Prompt with long-term memory facts
+    // 1. System Prompt
     buffer.writeln("<|im_start|>system");
     buffer.writeln(_memoryBank.buildSystemContext());
     buffer.writeln("<|im_end|>");
 
-    // 2. Rolling history (last 2 full turns MAX = 4 messages)
+    // 2. Last 1 turn of history (2 messages max) to keep context pure for SmolLM2
     final existingMessages = _messages.where((m) => m.text.isNotEmpty).toList();
-    final slice = existingMessages.length > 4
-        ? existingMessages.sublist(existingMessages.length - 4)
+    final slice = existingMessages.length > 2
+        ? existingMessages.sublist(existingMessages.length - 2)
         : existingMessages;
 
     for (final m in slice) {
@@ -770,7 +802,8 @@ class _ChatScreenState extends State<ChatScreen> {
       if (a.bytes != null && !a.isImage && a.size < 50000) {
         try {
           final decoded = utf8.decode(a.bytes!);
-          final preview = decoded.length > 120 ? decoded.substring(0, 120) : decoded;
+          final preview =
+              decoded.length > 100 ? decoded.substring(0, 100) : decoded;
           attachmentText.writeln("[File: ${a.name}]: $preview");
         } catch (_) {}
       }
@@ -796,15 +829,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
       final lower = cleanInput.toLowerCase();
 
-      final bool isFact = lower.startsWith("i ") ||
-          lower.startsWith("my ") ||
-          lower.contains("prefer") ||
-          lower.contains("like") ||
-          lower.contains("hate") ||
+      final bool isFact = lower.contains("my name is") ||
+          lower.contains("i am") ||
+          lower.contains("i'm") ||
           lower.contains("remember") ||
-          lower.contains("live in") ||
-          lower.contains("working on") ||
-          lower.contains("built");
+          lower.contains("prefer") ||
+          lower.contains("i live") ||
+          lower.contains("i work");
 
       if (isFact) {
         final existing = _memoryBank.facts.any(
@@ -817,15 +848,15 @@ class _ChatScreenState extends State<ChatScreen> {
             LearnedMemoryFact(
               id: DateTime.now().millisecondsSinceEpoch.toString(),
               fact: cleanInput,
-              category: 'discussion',
+              category: 'identity',
               learnedAt: DateTime.now(),
             ),
           );
         }
       }
 
-      if (_memoryBank.facts.length > 60) {
-        _memoryBank.facts = _memoryBank.facts.sublist(0, 60);
+      if (_memoryBank.facts.length > 50) {
+        _memoryBank.facts = _memoryBank.facts.sublist(0, 50);
       }
 
       await _saveMemoryToDisk();
@@ -880,7 +911,7 @@ class _ChatScreenState extends State<ChatScreen> {
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1E2230),
         title: const Text("Clear Chat?"),
-        content: const Text("This resets the current screen without erasing stored facts in the Memory Bank."),
+        content: const Text("This resets the screen without erasing facts in the Memory Bank."),
         actions: [
           TextButton(
             child: const Text("Cancel"),
@@ -896,7 +927,7 @@ class _ChatScreenState extends State<ChatScreen> {
     );
 
     if (confirm == true) {
-      _stopTts();
+      await _stopTts();
       setState(() {
         _messages.clear();
       });
@@ -977,7 +1008,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         Icon(Icons.bolt, size: 48, color: Colors.white.withValues(alpha: 0.2)),
                         const SizedBox(height: 8),
                         Text(
-                          "Continuous Chat Active\nFast Streaming Ready",
+                          "SmolLM Engine Ready\nContext-Protected Memory Active",
                           textAlign: TextAlign.center,
                           style: TextStyle(color: Colors.white.withValues(alpha: 0.4), fontSize: 13),
                         ),
@@ -1031,14 +1062,14 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: const TextStyle(fontSize: 14, color: Colors.white, height: 1.35),
               ),
             ),
-            // Action Bar below Assistant responses
+            // Per-Response Action Bar (Speaker & Copy)
             if (!m.isUser && m.text.isNotEmpty && m.text != "...")
               Padding(
                 padding: const EdgeInsets.only(top: 2, left: 4),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    // Speaker / Stop Audio Button
+                    // Speaker / Stop Toggle
                     InkWell(
                       borderRadius: BorderRadius.circular(16),
                       onTap: () => _toggleMessageSpeech(m),
@@ -1052,7 +1083,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       ),
                     ),
                     const SizedBox(width: 8),
-                    // Copy Response Button
+                    // Copy Button
                     InkWell(
                       borderRadius: BorderRadius.circular(16),
                       onTap: () {
@@ -1144,7 +1175,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: const TextStyle(color: Colors.white),
                 decoration: InputDecoration(
                   hintText: _isProcessing
-                      ? "Assistant is responding..."
+                      ? "Generating..."
                       : _isListening
                           ? "Listening..."
                           : "Message companion...",
