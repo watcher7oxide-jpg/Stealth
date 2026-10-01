@@ -267,7 +267,7 @@ class CognitiveMemoryBank {
     buffer.write("You are an intelligent, concise personal AI. Answer questions directly without repeating phrases. ");
 
     if (facts.isNotEmpty) {
-      buffer.write("Important facts to remember: ");
+      buffer.write("Important facts: ");
       final prioritized = List<LearnedMemoryFact>.from(facts)
         ..sort((a, b) {
           if (a.importance == "High" && b.importance != "High") return -1;
@@ -319,7 +319,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
@@ -339,18 +339,18 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _speechEnabled = false;
   bool _isListening = false;
   bool _voiceResponseEnabled = true; // <-- Default ON
-  bool _autoMicSend = true;          // <-- Auto-send message when speech ends
+  bool _autoMicSend = true;
 
-  // Hands-Free Ambient Voice Mode State
-  bool _handsFreeMode = false;
-  bool _isHandsFreeAsleep = false;
+  // Continuous Call-Style Ambient Mode
+  bool _callModeActive = false;
+  bool _isCallModeAsleep = false;
   String _wakeWord = "wake up";
   String _stopWord = "stop";
 
-  Timer? _silenceTimer;
+  Timer? _silenceCheckTimer;
   Timer? _speechPauseTimer;
 
-  // Active audio player tracker & Sequential worker
+  // Active audio player tracker
   String? _currentlySpeakingMessageId;
   final List<String> _ttsQueue = [];
   bool _isTtsWorkerRunning = false;
@@ -362,7 +362,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isProcessing = false;
   StreamSubscription<String>? _activeInferenceSubscription;
 
-  static const MethodChannel _pickerChannel =
+  static const MethodChannel _nativeChannel =
       MethodChannel('com.example.neural_companion/file_picker');
 
   ChatSession get _currentSession {
@@ -386,6 +386,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _checkPreviousNativeCrash();
     _initSpeechEngine();
     _initTtsEngine();
@@ -394,7 +395,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
-    _silenceTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    _setNativeWakeLock(false);
+    _silenceCheckTimer?.cancel();
     _speechPauseTimer?.cancel();
     _activeInferenceSubscription?.cancel();
     _textController.dispose();
@@ -405,7 +408,27 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
-  /* ---------------- MULTI-SESSION PERSISTENCE ---------------- */
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // If Call Mode is active, maintain WakeLock regardless of lifecycle
+    if (_callModeActive) {
+      _setNativeWakeLock(true);
+    }
+  }
+
+  Future<void> _setNativeWakeLock(bool enable) async {
+    try {
+      await _nativeChannel.invokeMethod('setWakeLock', {'enable': enable});
+    } catch (_) {}
+  }
+
+  Future<void> _playNativeTone(String type) async {
+    try {
+      await _nativeChannel.invokeMethod('playTone', {'type': type});
+    } catch (_) {}
+  }
+
+  /* ---------------- PERSISTENCE ---------------- */
 
   Future<File> _getSessionsFile() async {
     final dir = await getApplicationDocumentsDirectory();
@@ -503,7 +526,7 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (_) {}
   }
 
-  /* ---------------- SESSION MANAGEMENT ---------------- */
+  /* ---------------- SESSIONS ---------------- */
 
   Future<void> _createNewSession({bool showSnackbar = true}) async {
     await _stopGeneration();
@@ -558,21 +581,19 @@ class _ChatScreenState extends State<ChatScreen> {
     await _saveSessionsToDisk();
   }
 
-  /* ---------------- AUDIO & SPEECH HANDLERS ---------------- */
+  /* ---------------- AUDIO & TTS ENGINE ---------------- */
 
   Future<void> _initSpeechEngine() async {
     try {
       _speechEnabled = await _speech.initialize(
         onError: (_) {
           if (mounted) setState(() => _isListening = false);
+          _ensureCallModeMicReconnection();
         },
         onStatus: (val) {
           if (val == 'done' || val == 'notListening') {
             if (mounted) setState(() => _isListening = false);
-            // If in hands-free mode and not processing, handle silence or wake detection
-            if (_handsFreeMode && !_isProcessing && !_isHandsFreeAsleep) {
-              _startHandsFreeSilenceTimer();
-            }
+            _ensureCallModeMicReconnection();
           }
         },
       );
@@ -587,11 +608,9 @@ class _ChatScreenState extends State<ChatScreen> {
     await _tts.setSpeechRate(0.53);
     await _tts.setVolume(1.0);
 
-    // CRITICAL: Await completion prevents Android TTS from cutting off new sentences
+    // CRITICAL: Awaiting speak completion prevents cut-offs or restarting on new sentences
     await _tts.awaitSpeakCompletion(true);
   }
-
-  /* ---------------- NON-BLOCKING SEQUENTIAL TTS WORKER ---------------- */
 
   void _enqueueTtsText(String sentence, {String? messageId}) {
     final clean = sentence.trim();
@@ -627,9 +646,10 @@ class _ChatScreenState extends State<ChatScreen> {
     _isTtsWorkerRunning = false;
     if (_ttsQueue.isEmpty && mounted) {
       setState(() => _currentlySpeakingMessageId = null);
-      // Continuous loop: Listen to user immediately after assistant completes speaking
-      if (_handsFreeMode && !_isProcessing) {
-        _startHandsFreeListening();
+
+      // In Call Mode: Restart prompt listening as soon as speech finishes
+      if (_callModeActive && !_isProcessing) {
+        _startContinuousMic();
       }
     }
   }
@@ -666,103 +686,126 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /* ---------------- HANDS-FREE AMBIENT & BARGE-IN SYSTEM ---------------- */
+  /* ---------------- CALL-STYLE CONTINUOUS MIC ENGINE ---------------- */
 
-  void _toggleHandsFreeMode() {
+  void _toggleCallMode() {
     setState(() {
-      _handsFreeMode = !_handsFreeMode;
-      _isHandsFreeAsleep = false;
+      _callModeActive = !_callModeActive;
+      _isCallModeAsleep = false;
     });
 
-    if (_handsFreeMode) {
+    _setNativeWakeLock(_callModeActive);
+
+    if (_callModeActive) {
+      _playNativeTone("wake");
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text("Hands-Free Mode Active. Speak anytime or say Stop to halt."),
+          content: Text("Call Mode Active. Continuous mic connected."),
           duration: Duration(seconds: 2),
         ),
       );
-      _startHandsFreeListening();
+      _startContinuousMic();
     } else {
-      _silenceTimer?.cancel();
+      _silenceCheckTimer?.cancel();
       _speechPauseTimer?.cancel();
       _speech.stop();
+      _stopTts();
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Hands-Free Mode Deactivated"), duration: Duration(seconds: 1)),
+        const SnackBar(content: Text("Call Mode Disconnected"), duration: Duration(seconds: 1)),
       );
     }
   }
 
-  void _startHandsFreeListening() async {
-    if (!_speechEnabled || !_handsFreeMode) return;
+  /// Automatically keeps mic alive just like an active phone call
+  void _ensureCallModeMicReconnection() {
+    if (!_callModeActive) return;
 
-    _silenceTimer?.cancel();
-    _speechPauseTimer?.cancel();
+    Future.delayed(const Duration(milliseconds: 200), () {
+      if (_callModeActive && !_isListening) {
+        _startContinuousMic();
+      }
+    });
+  }
 
-    if (_isListening) await _speech.stop();
+  void _startContinuousMic() async {
+    if (!_speechEnabled || !_callModeActive) return;
+
+    if (_isListening) return;
 
     setState(() => _isListening = true);
 
     await _speech.listen(
       onResult: (SpeechRecognitionResult result) {
-        final recognized = result.recognizedWords.toLowerCase().trim();
+        final rawWords = result.recognizedWords.toLowerCase().trim();
 
-        // 1. BARGE-IN: User says stop word while generating or speaking
-        if ((_isProcessing || _isTtsWorkerRunning) && recognized.contains(_stopWord.toLowerCase())) {
-          HapticFeedback.heavyImpact();
-          _stopGeneration();
-          _stopTts();
-          _textController.clear();
+        // -------------------------------------------------------------
+        // STATE 1: Model is generating text OR TTS is speaking
+        // SEPARATE MIC PROCESSING: ONLY check for Stop Word!
+        // -------------------------------------------------------------
+        if (_isProcessing || _isTtsWorkerRunning) {
+          if (rawWords.contains(_stopWord.toLowerCase())) {
+            _playNativeTone("stop");
+            _stopGeneration();
+            _stopTts();
+            _textController.clear();
+            _startContinuousMic(); // Keep listening for next prompt
+          }
+          // Do NOT append to prompt while model is responding
           return;
         }
 
-        // 2. WAKE WORD: User wakes model from standby
-        if (_isHandsFreeAsleep) {
-          if (recognized.contains(_wakeWord.toLowerCase())) {
-            HapticFeedback.mediumImpact();
-            setState(() => _isHandsFreeAsleep = false);
+        // -------------------------------------------------------------
+        // STATE 2: Standby Sleep Mode
+        // ONLY check for Wake Word
+        // -------------------------------------------------------------
+        if (_isCallModeAsleep) {
+          if (rawWords.contains(_wakeWord.toLowerCase())) {
+            _playNativeTone("wake");
+            setState(() => _isCallModeAsleep = false);
             _tts.speak("I'm listening.");
+            _resetSilenceWatchdog();
           }
           return;
         }
 
-        // 3. Normal speech recognition in active mode
-        if (!_isProcessing) {
-          _textController.text = result.recognizedWords;
+        // -------------------------------------------------------------
+        // STATE 3: Prompt Dictation Mode (Stop/Wake words are allowed in text)
+        // -------------------------------------------------------------
+        _textController.text = result.recognizedWords;
+        _resetSilenceWatchdog();
 
-          // Restart pause timer for auto-send
-          _speechPauseTimer?.cancel();
-          if (_autoMicSend && result.recognizedWords.trim().isNotEmpty) {
-            _speechPauseTimer = Timer(const Duration(milliseconds: 1400), () {
-              if (_textController.text.trim().isNotEmpty && !_isProcessing) {
-                _handleSendMessage();
-              }
-            });
-          }
+        // Detect user pause to auto-send
+        _speechPauseTimer?.cancel();
+        if (_autoMicSend && result.recognizedWords.trim().isNotEmpty) {
+          _speechPauseTimer = Timer(const Duration(milliseconds: 1400), () {
+            if (_textController.text.trim().isNotEmpty && !_isProcessing) {
+              _handleSendMessage();
+            }
+          });
         }
       },
-      listenFor: const Duration(seconds: 30),
-      pauseFor: const Duration(seconds: 5),
+      listenFor: const Duration(seconds: 60),
+      pauseFor: const Duration(seconds: 4),
     );
 
-    _startHandsFreeSilenceTimer();
+    _resetSilenceWatchdog();
   }
 
-  void _startHandsFreeSilenceTimer() {
-    _silenceTimer?.cancel();
-    if (!_handsFreeMode || _isProcessing || _isHandsFreeAsleep) return;
+  void _resetSilenceWatchdog() {
+    _silenceCheckTimer?.cancel();
+    if (!_callModeActive || _isProcessing || _isCallModeAsleep) return;
 
-    // 10-Second Silence Check-In
-    _silenceTimer = Timer(const Duration(seconds: 10), () async {
-      if (!_handsFreeMode || _isProcessing || _isHandsFreeAsleep) return;
+    // 10 Seconds of silence -> Ask user
+    _silenceCheckTimer = Timer(const Duration(seconds: 10), () async {
+      if (!_callModeActive || _isProcessing || _isCallModeAsleep) return;
 
       await _tts.speak("Are you still there?");
 
-      // Second 10-second silence before entering Sleep Standby
-      _silenceTimer = Timer(const Duration(seconds: 10), () {
-        if (!_handsFreeMode || _isProcessing || _isHandsFreeAsleep) return;
-        setState(() => _isHandsFreeAsleep = true);
-        _speech.stop();
-        _tts.speak("Entering sleep mode. Say ${_wakeWord} to wake me.");
+      // Another 10 seconds of silence -> Enter sleep mode
+      _silenceCheckTimer = Timer(const Duration(seconds: 10), () {
+        if (!_callModeActive || _isProcessing || _isCallModeAsleep) return;
+        setState(() => _isCallModeAsleep = true);
+        _tts.speak("Standby. Say ${_wakeWord} to wake me.");
       });
     });
   }
@@ -783,7 +826,7 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _modelStatus = "Opening picker...");
 
       final String? selectedPath =
-          await _pickerChannel.invokeMethod<String>('pickGgufFile');
+          await _nativeChannel.invokeMethod<String>('pickGgufFile');
 
       if (selectedPath == null || selectedPath.isEmpty) {
         setState(() => _modelStatus = _loadedGgufPath != null
@@ -843,7 +886,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /* ---------------- INFERENCE & CANCELLATION ---------------- */
+  /* ---------------- INFERENCE & BACKGROUND EXECUTION ---------------- */
 
   Future<void> _stopGeneration() async {
     if (_activeInferenceSubscription != null) {
@@ -876,12 +919,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty && _selectedAttachments.isEmpty) return;
 
     _speechPauseTimer?.cancel();
-    _silenceTimer?.cancel();
-
-    if (_isListening) {
-      await _speech.stop();
-      _isListening = false;
-    }
+    _silenceCheckTimer?.cancel();
 
     if (_loadedGgufPath == null || !File(_loadedGgufPath!).existsSync()) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -893,8 +931,8 @@ class _ChatScreenState extends State<ChatScreen> {
     await _stopTts();
     _ttsStreamBuffer = "";
 
-    // Processing Beep / Audio Haptic Feedback
-    HapticFeedback.lightImpact();
+    // Audible processing chime
+    _playNativeTone("processing");
 
     final outgoingAttachments = List<AttachmentItem>.from(_selectedAttachments);
     final prompt = _buildCleanContextPrompt(text, outgoingAttachments);
@@ -967,14 +1005,17 @@ class _ChatScreenState extends State<ChatScreen> {
           streamBuffer.write(token);
           final currentText = streamBuffer.toString();
 
-          setState(() {
-            final idx = _currentSession.messages.indexWhere((m) => m.id == assistantMsgId);
-            if (idx != -1) {
-              _currentSession.messages[idx] =
-                  _currentSession.messages[idx].copyWith(text: currentText);
-            }
-          });
-          _scrollToBottom();
+          // Update UI safely without blocking background thread
+          if (mounted) {
+            setState(() {
+              final idx = _currentSession.messages.indexWhere((m) => m.id == assistantMsgId);
+              if (idx != -1) {
+                _currentSession.messages[idx] =
+                    _currentSession.messages[idx].copyWith(text: currentText);
+              }
+            });
+            _scrollToBottom();
+          }
 
           // Smooth sentence-by-sentence TTS streaming (No restarts/cutting)
           if (_voiceResponseEnabled) {
@@ -1022,19 +1063,22 @@ class _ChatScreenState extends State<ChatScreen> {
 
       final finalReply = streamBuffer.toString().trim();
 
-      setState(() {
-        final idx = _currentSession.messages.indexWhere((m) => m.id == assistantMsgId);
-        if (idx != -1) {
-          _currentSession.messages[idx] = _currentSession.messages[idx].copyWith(
-            text: finalReply.isNotEmpty ? finalReply : "(No response generated)",
-          );
-        }
+      if (mounted) {
+        setState(() {
+          final idx = _currentSession.messages.indexWhere((m) => m.id == assistantMsgId);
+          if (idx != -1) {
+            _currentSession.messages[idx] = _currentSession.messages[idx].copyWith(
+              text: finalReply.isNotEmpty ? finalReply : "(No response generated)",
+            );
+          }
+          _isProcessing = false;
+        });
+        _scrollToBottom();
+      } else {
         _isProcessing = false;
-      });
+      }
 
-      _scrollToBottom();
       await _saveSessionsToDisk();
-
       _distillAndStoreMemory(text, finalReply);
     } catch (e, stack) {
       setState(() => _isProcessing = false);
@@ -1084,7 +1128,7 @@ class _ChatScreenState extends State<ChatScreen> {
     return buffer.toString();
   }
 
-  /* ---------------- COGNITIVE REASONING & MEMORY EXTRACTION ---------------- */
+  /* ---------------- MEMORY REASONING EXTRACTION ---------------- */
 
   void _distillAndStoreMemory(String prompt, String reply) {
     unawaited(() async {
@@ -1214,15 +1258,14 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _scrollToBottom() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 150),
-          curve: Curves.easeOut,
-        );
-      }
-    });
+    // Only animate scroll when app is in foreground and has clients
+    if (!mounted || !_scrollController.hasClients) return;
+
+    _scrollController.animateTo(
+      _scrollController.position.maxScrollExtent,
+      duration: const Duration(milliseconds: 150),
+      curve: Curves.easeOut,
+    );
   }
 
   /* ---------------- UI CONSTRUCTION ---------------- */
@@ -1258,21 +1301,20 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ),
         actions: [
-          // Hands-Free Ambient Mode Toggle
+          // Call-Mode Toggle
           IconButton(
-            tooltip: _handsFreeMode ? "Ambient Hands-Free: ON" : "Ambient Hands-Free: OFF",
+            tooltip: _callModeActive ? "Call Mode: Active" : "Call Mode: Disconnected",
             icon: Icon(
-              _handsFreeMode ? Icons.record_voice_over : Icons.voice_over_off,
-              color: _handsFreeMode ? Colors.greenAccent : Colors.white38,
+              _callModeActive ? Icons.phone_in_talk : Icons.phone_outlined,
+              color: _callModeActive ? Colors.greenAccent : Colors.white38,
             ),
-            onPressed: _toggleHandsFreeMode,
+            onPressed: _toggleCallMode,
           ),
           IconButton(
             tooltip: "New Chat",
             icon: const Icon(Icons.add_comment_outlined, color: Color(0xFF00D2FF)),
             onPressed: () => _createNewSession(),
           ),
-          // Master Audio Toggle
           IconButton(
             tooltip: _voiceResponseEnabled ? "TTS Audio: ON" : "TTS Audio: OFF",
             icon: Icon(
@@ -1305,20 +1347,20 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       body: Column(
         children: [
-          if (_handsFreeMode)
+          if (_callModeActive)
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
-              color: _isHandsFreeAsleep ? Colors.amber.shade900 : Colors.green.shade900,
+              padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 12),
+              color: _isCallModeAsleep ? Colors.amber.shade900 : Colors.green.shade900,
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Icon(_isHandsFreeAsleep ? Icons.bedtime : Icons.graphic_eq, size: 14, color: Colors.white),
-                  const SizedBox(width: 6),
+                  Icon(_isCallModeAsleep ? Icons.bedtime : Icons.headset_mic, size: 14, color: Colors.white),
+                  const SizedBox(width: 8),
                   Text(
-                    _isHandsFreeAsleep
-                        ? "Standby. Say '$_wakeWord' to wake."
-                        : "Hands-Free Active. Say '$_stopWord' anytime to interrupt.",
+                    _isCallModeAsleep
+                        ? "Standby. Say '$_wakeWord' to resume."
+                        : "Call Active (Screen-Off/Background). Say '$_stopWord' anytime to stop.",
                     style: const TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.bold),
                   ),
                 ],
@@ -1545,9 +1587,8 @@ class _ChatScreenState extends State<ChatScreen> {
                       }
                     },
             ),
-            // Auto-Mic Indicator / Mic Button
             IconButton(
-              tooltip: _autoMicSend ? "Auto-Send Mic: ON" : "Manual Mic: ON",
+              tooltip: _autoMicSend ? "Auto-Send: ON" : "Manual Mic",
               icon: Stack(
                 alignment: Alignment.topRight,
                 children: [
@@ -1630,7 +1671,7 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  /* ---------------- SETTINGS & TRIGGER WORDS MODAL ---------------- */
+  /* ---------------- OPTIONS & WAKE/STOP TRIGGER SETTINGS ---------------- */
 
   void _showSettingsDialog() {
     final wakeCtrl = TextEditingController(text: _wakeWord);
@@ -1642,7 +1683,7 @@ class _ChatScreenState extends State<ChatScreen> {
         builder: (context, setDlgState) {
           return AlertDialog(
             backgroundColor: const Color(0xFF1E2230),
-            title: const Text("Options & Voice Triggers", style: TextStyle(color: Colors.white, fontSize: 16)),
+            title: const Text("Audio & Voice Triggers", style: TextStyle(color: Colors.white, fontSize: 16)),
             content: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -1651,7 +1692,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,
                     title: const Text("Auto-Send After Speaking", style: TextStyle(fontSize: 13, color: Colors.white)),
-                    subtitle: const Text("Automatically submits message after 1.5s pause", style: TextStyle(fontSize: 11, color: Colors.white38)),
+                    subtitle: const Text("Submits prompt after 1.4s speech pause", style: TextStyle(fontSize: 11, color: Colors.white38)),
                     value: _autoMicSend,
                     activeColor: const Color(0xFF00D2FF),
                     onChanged: (val) async {
@@ -1663,6 +1704,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                   const Divider(color: Colors.white10),
                   const Text("Barge-In Stop Word:", style: TextStyle(fontSize: 12, color: Colors.white70, fontWeight: FontWeight.bold)),
+                  const Text("Stops response & speech while model is talking.", style: TextStyle(fontSize: 10, color: Colors.white38)),
                   const SizedBox(height: 4),
                   TextField(
                     controller: stopCtrl,
@@ -1676,6 +1718,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                   const SizedBox(height: 12),
                   const Text("Ambient Wake-Up Word:", style: TextStyle(fontSize: 12, color: Colors.white70, fontWeight: FontWeight.bold)),
+                  const Text("Wakes model from standby after 20s of silence.", style: TextStyle(fontSize: 10, color: Colors.white38)),
                   const SizedBox(height: 4),
                   TextField(
                     controller: wakeCtrl,
