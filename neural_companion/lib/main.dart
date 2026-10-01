@@ -675,8 +675,7 @@ class _ChatScreenState extends State<ChatScreen> {
         temperature: 0.6,
         maxTokens: 300,
         repeatPenalty: 1.18, // Forbids infinite repetition of "Tot Tot" or "()"
-        repeatLastN: 64,
-        penalizeNl: true,
+        repeatLastN: 64
       );
 
       _activeInferenceSubscription = stream.listen(
